@@ -1,5 +1,9 @@
 // ============================================================
-// VCam Plus v5.7 — Direct method hook (no proxy delegate)
+// VCam Plus v5.8 — ISA-swizzle approach (KVO-like, safe)
+// Instead of modifying the delegate class's method (which
+// affects ALL instances and causes crashes), we create a
+// dynamic subclass per-delegate-class and ISA-swizzle only
+// the specific delegate instance — same technique as KVO.
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -45,9 +49,9 @@ static NSTimeInterval gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char  kOverlayKey;
 
-// For dynamic delegate hooking
-static NSMutableDictionary *gOrigIMPs      = nil; // className -> NSValue(IMP)
-static NSMutableSet        *gHookedClasses = nil;
+// For ISA-swizzle hooking
+static char   kOrigIMPKey;   // associated object key for original IMP on subclass
+static NSLock *gClassLock = nil;
 
 // ============================================================
 // Helpers
@@ -282,21 +286,36 @@ static NSMutableArray *gOverlays = nil;
 @end
 
 // ============================================================
-// Dynamic delegate method hooking (replaces proxy approach)
-// Instead of replacing the delegate object, we hook the
-// delegate CLASS's method directly. The app never sees a
-// different delegate — only the method implementation changes.
+// ISA-swizzle delegate hooking (KVO-like)
+//
+// For each delegate class, we create a dynamic subclass
+// "VCam_OrigClassName" and override captureOutput: in it.
+// Then we change only the specific delegate INSTANCE's isa
+// to point to our subclass. This way:
+//   - [delegate class] returns the original class (we override it)
+//   - [delegate isKindOfClass:] works correctly
+//   - [delegate isMemberOfClass:] works correctly
+//   - The original class is NOT modified at all
+//   - Other instances of the same class are NOT affected
 // ============================================================
 typedef void (*CaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
 static void vcam_hooked_captureOutput(id self, SEL _cmd, AVCaptureOutput *output,
                                        CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
     @try {
-        // Look up the original IMP for this class
-        NSString *className = NSStringFromClass([self class]);
-        NSValue *impVal = nil;
-        @synchronized(gOrigIMPs) { impVal = gOrigIMPs[className]; }
+        // Get original IMP stored on our dynamic subclass
+        Class myClass = object_getClass(self);
+        NSValue *impVal = objc_getAssociatedObject(myClass, &kOrigIMPKey);
         CaptureOutputIMP origIMP = impVal ? (CaptureOutputIMP)[impVal pointerValue] : NULL;
+
+        // Fallback: get IMP from superclass (the original class)
+        if (!origIMP) {
+            Class superClass = class_getSuperclass(myClass);
+            if (superClass) {
+                Method m = class_getInstanceMethod(superClass, _cmd);
+                if (m) origIMP = (CaptureOutputIMP)method_getImplementation(m);
+            }
+        }
 
         if (!origIMP) return;
 
@@ -312,42 +331,69 @@ static void vcam_hooked_captureOutput(id self, SEL _cmd, AVCaptureOutput *output
     } @catch (NSException *e) {}
 }
 
-// Hook a delegate class's captureOutput:didOutputSampleBuffer:fromConnection: method
-static void vcam_hookDelegateClass(Class delegateClass) {
+static void vcam_swizzleDelegate(id delegate) {
     @try {
-        NSString *className = NSStringFromClass(delegateClass);
-        @synchronized(gHookedClasses) {
-            if ([gHookedClasses containsObject:className]) return;
-        }
+        if (!delegate) return;
 
+        // Check if already ISA-swizzled by us
+        Class currentClass = object_getClass(delegate);
+        NSString *currentName = NSStringFromClass(currentClass);
+        if ([currentName hasPrefix:@"VCam_"]) return;
+
+        // Must implement captureOutput:didOutputSampleBuffer:fromConnection:
         SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-
-        // Only hook if this class directly implements the method (not inherited)
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(delegateClass, &count);
-        BOOL found = NO;
-        for (unsigned int i = 0; i < count; i++) {
-            if (method_getName(methods[i]) == sel) { found = YES; break; }
-        }
-        free(methods);
-
-        if (!found) return; // Method is inherited, don't hook to avoid affecting parent class
-
-        Method m = class_getInstanceMethod(delegateClass, sel);
-        if (!m) return;
-
-        IMP origIMP = method_setImplementation(m, (IMP)vcam_hooked_captureOutput);
-
-        @synchronized(gOrigIMPs) {
-            gOrigIMPs[className] = [NSValue valueWithPointer:(void *)origIMP];
-        }
-        @synchronized(gHookedClasses) {
-            [gHookedClasses addObject:className];
+        if (![delegate respondsToSelector:sel]) {
+            vcam_log([NSString stringWithFormat:@"Delegate %@ no captureOutput:, skip", currentName]);
+            return;
         }
 
-        vcam_log([NSString stringWithFormat:@"Hooked delegate: %@", className]);
+        [gClassLock lock];
+        @try {
+            // Create or reuse dynamic subclass
+            NSString *subName = [NSString stringWithFormat:@"VCam_%@", currentName];
+            Class subclass = NSClassFromString(subName);
+
+            if (!subclass) {
+                subclass = objc_allocateClassPair(currentClass, subName.UTF8String, 0);
+                if (!subclass) {
+                    vcam_log([NSString stringWithFormat:@"Failed to create subclass for %@", currentName]);
+                    [gClassLock unlock];
+                    return;
+                }
+
+                // Override captureOutput:didOutputSampleBuffer:fromConnection:
+                Method m = class_getInstanceMethod(currentClass, sel);
+                if (m) {
+                    IMP origIMP = method_getImplementation(m);
+                    class_addMethod(subclass, sel, (IMP)vcam_hooked_captureOutput, method_getTypeEncoding(m));
+                    // Store original IMP as associated object on the subclass
+                    objc_setAssociatedObject(subclass, &kOrigIMPKey,
+                        [NSValue valueWithPointer:(void *)origIMP], OBJC_ASSOCIATION_RETAIN);
+                }
+
+                // Override -class to return original class (same as KVO)
+                Class origClassCapture = currentClass;
+                SEL classSel = @selector(class);
+                Method classM = class_getInstanceMethod(currentClass, classSel);
+                if (classM) {
+                    IMP classImp = imp_implementationWithBlock(^Class(id self_) {
+                        return origClassCapture;
+                    });
+                    class_addMethod(subclass, classSel, classImp, method_getTypeEncoding(classM));
+                }
+
+                objc_registerClassPair(subclass);
+                vcam_log([NSString stringWithFormat:@"Created dynamic subclass: %@", subName]);
+            }
+
+            // ISA-swizzle: change only this instance's class pointer
+            object_setClass(delegate, subclass);
+            vcam_log([NSString stringWithFormat:@"ISA-swizzled delegate: %@ -> %@", currentName, subName]);
+        } @finally {
+            [gClassLock unlock];
+        }
     } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Hook delegate error: %@", e]);
+        vcam_log([NSString stringWithFormat:@"Swizzle error: %@", e]);
     }
 }
 
@@ -432,7 +478,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.7"
+        alertControllerWithTitle:@"VCam Plus v5.8"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -552,8 +598,8 @@ static void vcam_showMenu(void) {
         if (delegate) {
             vcam_log([NSString stringWithFormat:@"setSampleBufferDelegate: %@",
                       NSStringFromClass([delegate class])]);
-            // Dynamically hook the delegate's class method (not the object)
-            vcam_hookDelegateClass([delegate class]);
+            // ISA-swizzle: only modifies this instance, not the class
+            vcam_swizzleDelegate(delegate);
         }
     } @catch (NSException *e) {}
 }
@@ -575,10 +621,9 @@ static void vcam_showMenu(void) {
 %ctor {
     @autoreleasepool {
         @try {
-            gLock          = [[NSLock alloc] init];
-            gOverlays      = [NSMutableArray new];
-            gOrigIMPs      = [NSMutableDictionary new];
-            gHookedClasses = [NSMutableSet new];
+            gLock      = [[NSLock alloc] init];
+            gClassLock = [[NSLock alloc] init];
+            gOverlays  = [NSMutableArray new];
 
             [[NSFileManager defaultManager]
                 createDirectoryAtPath:VCAM_DIR
