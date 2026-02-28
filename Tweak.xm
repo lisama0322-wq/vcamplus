@@ -1,20 +1,41 @@
 // ============================================================
-// VCam Plus v5 — Hook SBVolumeControl (SpringBoard private class)
+// VCam Plus v5.1 — with diagnostics
 // Architecture:
-//   SpringBoard process: hook volume buttons → show UI
-//   Camera app processes: hook AVCaptureVideoDataOutput → replace frames
+//   SpringBoard: hook SBVolumeControl → show UI
+//   Camera apps: hook AVCaptureVideoDataOutput → replace frames
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 
-#define VCAM_DIR   @"/var/mobile/Library/Caches/vcamplus"
+#define VCAM_DIR   @"/var/tmp/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
 #define VCAM_FLAG  VCAM_DIR @"/enabled"
+#define VCAM_LOG   @"/var/tmp/vcam_debug.log"
 
 // ============================================================
 // Forward declarations
 // ============================================================
 static void vcam_showMenu(void);
+
+// ============================================================
+// Debug logging
+// ============================================================
+static void vcam_log(NSString *msg) {
+    NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                 dateStyle:NSDateFormatterNoStyle
+                                                 timeStyle:NSDateFormatterMediumStyle];
+    NSString *proc = [[NSProcessInfo processInfo] processName];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@: %@\n", ts, proc, msg];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:VCAM_LOG]) {
+        [fm createFileAtPath:VCAM_LOG contents:nil attributes:nil];
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:VCAM_LOG];
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
 
 // ============================================================
 // Globals
@@ -27,6 +48,11 @@ static NSMutableSet              *gProxies = nil;
 // Volume combo detection (SpringBoard only)
 static NSTimeInterval gLastUpTime   = 0;
 static NSTimeInterval gLastDownTime = 0;
+
+// Debug counters
+static int gHookCount = 0;
+static int gFrameCount = 0;
+static int gReplaceCount = 0;
 
 // ============================================================
 // Helpers
@@ -50,17 +76,26 @@ static BOOL vcam_openReader(void) {
     gReader = nil;
     gOutput = nil;
 
-    if (!vcam_videoExists()) return NO;
+    if (!vcam_videoExists()) {
+        vcam_log(@"openReader: video file not found");
+        return NO;
+    }
 
     NSURL *url = [NSURL fileURLWithPath:VCAM_VIDEO];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url
                                             options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
     NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
-    if (tracks.count == 0) return NO;
+    if (tracks.count == 0) {
+        vcam_log(@"openReader: no video tracks found");
+        return NO;
+    }
 
     NSError *err = nil;
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
-    if (!reader || err) return NO;
+    if (!reader || err) {
+        vcam_log([NSString stringWithFormat:@"openReader: AVAssetReader error: %@", err]);
+        return NO;
+    }
 
     NSDictionary *settings = @{
         (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
@@ -69,16 +104,24 @@ static BOOL vcam_openReader(void) {
         [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks[0] outputSettings:settings];
     output.alwaysCopiesSampleData = NO;
 
-    if (![reader canAddOutput:output]) return NO;
+    if (![reader canAddOutput:output]) {
+        vcam_log(@"openReader: canAddOutput failed");
+        return NO;
+    }
     [reader addOutput:output];
-    if (![reader startReading]) return NO;
+    if (![reader startReading]) {
+        vcam_log([NSString stringWithFormat:@"openReader: startReading failed: %@", reader.error]);
+        return NO;
+    }
 
     gReader = reader;
     gOutput = output;
+    vcam_log(@"openReader: SUCCESS");
     return YES;
 }
 
 static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
+    gFrameCount++;
     if (!vcam_isEnabled()) return NULL;
 
     [gLock lock];
@@ -89,7 +132,6 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     if (gReader) {
         frame = [gOutput copyNextSampleBuffer];
         if (!frame) {
-            // Loop: reopen
             if (vcam_openReader())
                 frame = [gOutput copyNextSampleBuffer];
         }
@@ -108,7 +150,14 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
         kCFAllocatorDefault, frame, 1, &timing, &timedFrame);
     CFRelease(frame);
 
-    return (st == noErr) ? timedFrame : NULL;
+    if (st == noErr && timedFrame) {
+        gReplaceCount++;
+        if (gReplaceCount == 1) {
+            vcam_log(@"First frame replaced successfully!");
+        }
+        return timedFrame;
+    }
+    return NULL;
 }
 
 // ============================================================
@@ -174,12 +223,16 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
     NSURL *url = info[UIImagePickerControllerMediaURL];
+    vcam_log([NSString stringWithFormat:@"imagePickerDone: url=%@", url]);
     if (!url) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:VCAM_VIDEO error:nil];
-    [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
-    // Enable automatically after selecting video
+    NSError *err = nil;
+    [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:&err];
+    vcam_log([NSString stringWithFormat:@"copyVideo: err=%@", err]);
     [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    vcam_log([NSString stringWithFormat:@"flagExists=%d videoExists=%d",
+              vcam_flagExists(), vcam_videoExists()]);
     [gLock lock]; gReader = nil; gOutput = nil; [gLock unlock];
 }
 
@@ -190,13 +243,15 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 - (void)documentPicker:(UIDocumentPickerViewController *)ctrl
     didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject;
+    vcam_log([NSString stringWithFormat:@"docPickerDone: url=%@", url]);
     if (!url) return;
     BOOL sec = [url startAccessingSecurityScopedResource];
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:VCAM_VIDEO error:nil];
-    [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
+    NSError *err = nil;
+    [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:&err];
     if (sec) [url stopAccessingSecurityScopedResource];
-    // Enable automatically after selecting video
+    vcam_log([NSString stringWithFormat:@"copyVideo: err=%@", err]);
     [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
     [gLock lock]; gReader = nil; gOutput = nil; [gLock unlock];
 }
@@ -233,16 +288,23 @@ static void vcam_showMenu(void) {
     BOOL enabled = vcam_flagExists();
     BOOL hasVideo = vcam_videoExists();
 
-    NSString *status;
-    if (enabled && hasVideo)
-        status = @"状态: 已开启";
-    else if (hasVideo)
-        status = @"状态: 已关闭 (视频已选择)";
-    else
-        status = @"状态: 未选择视频";
+    // Get video file size
+    NSString *videoInfo = @"无";
+    if (hasVideo) {
+        NSDictionary *attrs = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:VCAM_VIDEO error:nil];
+        long long sz = [attrs fileSize];
+        videoInfo = [NSString stringWithFormat:@"%.1f MB", sz / 1048576.0];
+    }
+
+    NSString *status = [NSString stringWithFormat:
+        @"开关: %@\n视频: %@\n路径: %@",
+        enabled ? @"已开启" : @"已关闭",
+        videoInfo,
+        VCAM_VIDEO];
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus"
+        alertControllerWithTitle:@"VCam Plus v5.1"
                          message:status
                   preferredStyle:UIAlertControllerStyleAlert];
 
@@ -287,15 +349,45 @@ static void vcam_showMenu(void) {
                     handler:^(UIAlertAction *a) {
             [[NSFileManager defaultManager] removeItemAtPath:VCAM_FLAG error:nil];
             [gLock lock]; gReader = nil; gOutput = nil; [gLock unlock];
+            vcam_log(@"User disabled vcam");
         }]];
-    } else if (hasVideo) {
+    } else {
         [alert addAction:[UIAlertAction
             actionWithTitle:@"开启虚拟摄像头"
                       style:UIAlertActionStyleDefault
                     handler:^(UIAlertAction *a) {
             [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            vcam_log([NSString stringWithFormat:@"User enabled vcam, flagExists=%d", vcam_flagExists()]);
         }]];
     }
+
+    // Diagnostics
+    [alert addAction:[UIAlertAction
+        actionWithTitle:@"查看诊断日志"
+                  style:UIAlertActionStyleDefault
+                handler:^(UIAlertAction *a) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *log = [NSString stringWithContentsOfFile:VCAM_LOG
+                                                     encoding:NSUTF8StringEncoding error:nil];
+            if (!log || log.length == 0) log = @"(日志为空 - 没有任何进程加载过插件)";
+            // Show last 2000 chars
+            if (log.length > 2000)
+                log = [log substringFromIndex:log.length - 2000];
+
+            UIAlertController *logAlert = [UIAlertController
+                alertControllerWithTitle:@"诊断日志"
+                                 message:log
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [logAlert addAction:[UIAlertAction actionWithTitle:@"清除日志"
+                style:UIAlertActionStyleDestructive
+                handler:^(UIAlertAction *a2) {
+                    [@"" writeToFile:VCAM_LOG atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }]];
+            [logAlert addAction:[UIAlertAction actionWithTitle:@"关闭"
+                style:UIAlertActionStyleCancel handler:nil]];
+            [vcam_topVC() presentViewController:logAlert animated:YES completion:nil];
+        });
+    }]];
 
     [alert addAction:[UIAlertAction
         actionWithTitle:@"取消"
@@ -352,6 +444,9 @@ static void vcam_showMenu(void) {
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
     if (delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
+        gHookCount++;
+        vcam_log([NSString stringWithFormat:@"HOOK setSampleBufferDelegate #%d, delegate=%@",
+                  gHookCount, NSStringFromClass([delegate class])]);
         VCamProxyDelegate *proxy = [VCamProxyDelegate new];
         proxy.realDelegate = delegate;
         @synchronized(gProxies) {
@@ -381,13 +476,19 @@ static void vcam_showMenu(void) {
                          attributes:nil
                                error:nil];
 
-        // Always init camera hooks (works in all UIKit processes)
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
+
+        // Always init camera hooks
         %init(CamHooks);
+        vcam_log(@"CamHooks initialized");
 
         // Init SpringBoard hooks only if SBVolumeControl exists
         Class sbvc = NSClassFromString(@"SBVolumeControl");
         if (sbvc) {
             %init(SBHooks);
+            vcam_log(@"SBHooks initialized (SpringBoard)");
         }
     }
 }
