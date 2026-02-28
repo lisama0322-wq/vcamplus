@@ -1,13 +1,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <substrate.h>
 #import <UIKit/UIKit.h>
-
-//
-// VCam Plus v3 - Virtual camera for iOS 16 + Dopamine rootless
-//
-// Volume Up then Down (or Down then Up) within 0.5s = open menu
-// Uses UIAlertController like the original tweak
-//
+#import <MediaPlayer/MediaPlayer.h>
 
 #define VCAM_DIR   @"/var/mobile/Library/Caches/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
@@ -17,6 +11,7 @@
 // Forward declarations
 // ============================================================
 static void vcam_showMenu(void);
+static void vcam_setupVolumeMonitor(void);
 
 // ============================================================
 // Global state
@@ -27,8 +22,11 @@ static AVAssetReaderTrackOutput  *gOutput  = nil;
 static NSMutableSet              *gProxies = nil;
 
 // Volume detection
-static NSTimeInterval gLastUpTime   = 0;
-static NSTimeInterval gLastDownTime = 0;
+static UISlider      *gVolSlider     = nil;
+static float          gPrevVol       = -1;
+static NSTimeInterval gLastUpTime    = 0;
+static NSTimeInterval gLastDownTime  = 0;
+static BOOL           gVolumeSetup   = NO;
 
 // ============================================================
 // Helpers
@@ -155,38 +153,87 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 @end
 
 // ============================================================
-// Volume observer - uses KVO on AVAudioSession outputVolume
+// Volume & Menu helper
 // ============================================================
-@interface VCamVolumeObserver : NSObject <UIImagePickerControllerDelegate, UINavigationControllerDelegate, UIDocumentPickerDelegate>
+@interface VCamHelper : NSObject
+    <UIImagePickerControllerDelegate, UINavigationControllerDelegate, UIDocumentPickerDelegate>
 + (instancetype)shared;
+- (void)volumeChanged;
 @end
 
-@implementation VCamVolumeObserver
+@implementation VCamHelper
 
 + (instancetype)shared {
-    static VCamVolumeObserver *inst;
+    static VCamHelper *inst;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [[VCamVolumeObserver alloc] init]; });
+    dispatch_once(&once, ^{ inst = [[VCamHelper alloc] init]; });
     return inst;
 }
 
+- (void)volumeChanged {
+    if (!gVolSlider) return;
+    float newVol = gVolSlider.value;
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+
+    if (gPrevVol >= 0 && newVol != gPrevVol) {
+        if (newVol > gPrevVol) {
+            gLastUpTime = now;
+        } else {
+            gLastDownTime = now;
+        }
+
+        if (gLastUpTime > 0 && gLastDownTime > 0 &&
+            fabs(gLastUpTime - gLastDownTime) < 0.5) {
+            gLastUpTime = 0;
+            gLastDownTime = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                vcam_showMenu();
+            });
+        }
+    }
+    gPrevVol = newVol;
+}
+
+// Also listen for private notification as fallback
+- (void)systemVolumeChanged:(NSNotification *)note {
+    NSString *reason = note.userInfo[@"AVSystemController_AudioVolumeChangeReasonNotificationParameter"];
+    if (![reason isEqualToString:@"ExplicitVolumeChange"]) return;
+
+    float newVol = [note.userInfo[@"AVSystemController_AudioVolumeNotificationParameter"] floatValue];
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+
+    if (gPrevVol >= 0 && newVol != gPrevVol) {
+        if (newVol > gPrevVol) {
+            gLastUpTime = now;
+        } else {
+            gLastDownTime = now;
+        }
+
+        if (gLastUpTime > 0 && gLastDownTime > 0 &&
+            fabs(gLastUpTime - gLastDownTime) < 0.5) {
+            gLastUpTime = 0;
+            gLastDownTime = 0;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                vcam_showMenu();
+            });
+        }
+    }
+    gPrevVol = newVol;
+}
+
+// KVO fallback
 - (void)observeValueForKeyPath:(NSString *)keyPath
                       ofObject:(id)object
                         change:(NSDictionary *)change
                        context:(void *)context {
     if (![keyPath isEqualToString:@"outputVolume"]) return;
-
     float oldVol = [change[NSKeyValueChangeOldKey] floatValue];
     float newVol = [change[NSKeyValueChangeNewKey] floatValue];
     if (oldVol == newVol) return;
 
     NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-
-    if (newVol > oldVol) {
-        gLastUpTime = now;
-    } else {
-        gLastDownTime = now;
-    }
+    if (newVol > oldVol) gLastUpTime = now;
+    else gLastDownTime = now;
 
     if (gLastUpTime > 0 && gLastDownTime > 0 &&
         fabs(gLastUpTime - gLastDownTime) < 0.5) {
@@ -232,7 +279,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
 @end
 
 // ============================================================
-// Menu UI - UIAlertController (same style as original tweak)
+// Menu - UIAlertController
 // ============================================================
 static UIViewController *vcam_topVC(void) {
     UIWindow *window = nil;
@@ -245,6 +292,7 @@ static UIViewController *vcam_topVC(void) {
         }
     }
     if (!window) window = [UIApplication sharedApplication].windows.firstObject;
+    if (!window) return nil;
     UIViewController *vc = window.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
@@ -253,30 +301,26 @@ static UIViewController *vcam_topVC(void) {
 static void vcam_showMenu(void) {
     UIViewController *topVC = vcam_topVC();
     if (!topVC) return;
-    // Don't show if already presenting an alert
     if ([topVC isKindOfClass:[UIAlertController class]]) return;
 
     NSString *status;
-    if (vcam_isEnabled()) {
-        status = @"Status: ON";
-    } else if (vcam_videoExists()) {
-        status = @"Status: OFF";
-    } else {
-        status = @"Status: No video";
-    }
+    if (vcam_isEnabled())
+        status = @"[ON] Camera replaced";
+    else if (vcam_videoExists())
+        status = @"[OFF] Ready";
+    else
+        status = @"[No video selected]";
 
     NSString *msg = [NSString stringWithFormat:
-        @"Volume+ then Volume- = Open menu\n"
-        @"Select a video to use as camera.\n"
-        @"Aspect ratio 4:3 or 16:9 recommended.\n\n"
-        @"%@", status];
+        @"Volume+ then Volume- to open menu\n"
+        @"Video ratio 4:3 or 16:9 recommended\n\n"
+        @"Status: %@", status];
 
     UIAlertController *alert = [UIAlertController
         alertControllerWithTitle:@"VCam Plus"
                          message:msg
                   preferredStyle:UIAlertControllerStyleAlert];
 
-    // Select from Photos
     [alert addAction:[UIAlertAction
         actionWithTitle:@"Select from Photos"
                   style:UIAlertActionStyleDefault
@@ -284,11 +328,10 @@ static void vcam_showMenu(void) {
         UIImagePickerController *picker = [[UIImagePickerController alloc] init];
         picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
         picker.mediaTypes = @[@"public.movie"];
-        picker.delegate = [VCamVolumeObserver shared];
+        picker.delegate = [VCamHelper shared];
         [vcam_topVC() presentViewController:picker animated:YES completion:nil];
     }]];
 
-    // Select from Files
     [alert addAction:[UIAlertAction
         actionWithTitle:@"Select from Files"
                   style:UIAlertActionStyleDefault
@@ -296,14 +339,13 @@ static void vcam_showMenu(void) {
         UIDocumentPickerViewController *picker =
             [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.movie"]
                                                                   inMode:UIDocumentPickerModeImport];
-        picker.delegate = [VCamVolumeObserver shared];
+        picker.delegate = [VCamHelper shared];
         [vcam_topVC() presentViewController:picker animated:YES completion:nil];
     }]];
 
-    // Enable / Disable toggle
     if (vcam_flagExists()) {
         [alert addAction:[UIAlertAction
-            actionWithTitle:@"Disable Camera Replace"
+            actionWithTitle:@"Disable Replace"
                       style:UIAlertActionStyleDestructive
                     handler:^(UIAlertAction *a) {
             [[NSFileManager defaultManager] removeItemAtPath:VCAM_FLAG error:nil];
@@ -311,20 +353,72 @@ static void vcam_showMenu(void) {
         }]];
     } else {
         [alert addAction:[UIAlertAction
-            actionWithTitle:@"Enable Camera Replace"
+            actionWithTitle:@"Enable Replace"
                       style:UIAlertActionStyleDefault
                     handler:^(UIAlertAction *a) {
             [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }]];
     }
 
-    // Cancel
     [alert addAction:[UIAlertAction
         actionWithTitle:@"Cancel"
                   style:UIAlertActionStyleCancel
                 handler:nil]];
 
     [topVC presentViewController:alert animated:YES completion:nil];
+}
+
+// ============================================================
+// Volume monitor setup - 3 methods combined for reliability
+// ============================================================
+static void vcam_setupVolumeMonitor(void) {
+    if (gVolumeSetup) return;
+    gVolumeSetup = YES;
+
+    UIWindow *window = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { window = w; break; }
+            }
+            if (window) break;
+        }
+    }
+    if (!window) window = [UIApplication sharedApplication].windows.firstObject;
+    if (!window) { gVolumeSetup = NO; return; }
+
+    // Method 1: Hidden MPVolumeView slider (most reliable)
+    MPVolumeView *volView = [[MPVolumeView alloc] initWithFrame:CGRectMake(-2000, -2000, 0, 0)];
+    volView.alpha = 0.01;
+    [window addSubview:volView];
+
+    for (UIView *view in volView.subviews) {
+        if ([view isKindOfClass:[UISlider class]]) {
+            gVolSlider = (UISlider *)view;
+            gPrevVol = gVolSlider.value;
+            [gVolSlider addTarget:[VCamHelper shared]
+                           action:@selector(volumeChanged)
+                 forControlEvents:UIControlEventValueChanged];
+            break;
+        }
+    }
+
+    // Method 2: Private notification (fallback)
+    [[NSNotificationCenter defaultCenter]
+        addObserver:[VCamHelper shared]
+           selector:@selector(systemVolumeChanged:)
+               name:@"AVSystemController_SystemVolumeDidChangeNotification"
+             object:nil];
+
+    // Method 3: KVO on AVAudioSession (secondary fallback)
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    if (gPrevVol < 0) gPrevVol = session.outputVolume;
+    @try {
+        [session addObserver:[VCamHelper shared]
+                  forKeyPath:@"outputVolume"
+                     options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld
+                     context:nil];
+    } @catch (NSException *e) {}
 }
 
 // ============================================================
@@ -360,18 +454,22 @@ static void vcam_showMenu(void) {
                          attributes:nil
                                error:nil];
 
-        // Volume detection + menu only in UIKit apps (not WebContent)
+        // Volume detection only in UIKit apps
         if ([UIApplication sharedApplication]) {
-            // Use KVO on AVAudioSession outputVolume - reliable on iOS 16
-            AVAudioSession *session = [AVAudioSession sharedInstance];
-            [session setCategory:AVAudioSessionCategoryAmbient
-                     withOptions:AVAudioSessionCategoryOptionMixWithOthers
-                           error:nil];
-            [session setActive:YES error:nil];
-            [session addObserver:[VCamVolumeObserver shared]
-                      forKeyPath:@"outputVolume"
-                         options:NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld
-                         context:nil];
+            // Wait for app to become active, then set up volume monitor
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidBecomeActiveNotification
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                            vcam_setupVolumeMonitor();
+                        }];
+
+            // Also try after a short delay (for SpringBoard)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                dispatch_get_main_queue(), ^{
+                    vcam_setupVolumeMonitor();
+                });
         }
     }
 }
