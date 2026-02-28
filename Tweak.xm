@@ -1,17 +1,21 @@
 #import <AVFoundation/AVFoundation.h>
 #import <substrate.h>
+#import <UIKit/UIKit.h>
+#import <PhotosUI/PhotosUI.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 //
-// VCam Plus - Virtual camera tweak for iOS 16 + Dopamine rootless
+// VCam Plus v2 - Virtual camera tweak for iOS 16 + Dopamine rootless
 //
-// Works in:
-//   - All UIKit-based apps (hook on AVCaptureVideoDataOutput)
-//   - Safari web pages (WebContent process, same hook)
+// Features:
+//   - Replace camera in all apps AND Safari web pages
+//   - Volume Up + Down to toggle control panel
+//   - GUI: on/off switch, select video from Photos or Files
 //
-// Setup:
-//   1. Place video at /var/mobile/Library/Caches/vcamplus/video.mp4
-//   2. Create empty file at /var/mobile/Library/Caches/vcamplus/enabled
-//   Tweak will then replace camera output with the video, looping continuously.
+// Architecture:
+//   - AVFoundation hook runs in ALL processes (apps + WebContent)
+//   - UI + volume detection runs only in UIKit apps
+//   - State shared via files in /var/mobile/Library/Caches/vcamplus/
 //
 
 #define VCAM_DIR   @"/var/mobile/Library/Caches/vcamplus"
@@ -19,22 +23,58 @@
 #define VCAM_FLAG  VCAM_DIR @"/enabled"
 
 // ============================================================
-// Global state (protected by gLock)
+// Forward declarations
 // ============================================================
-static NSLock               *gLock        = nil;
-static AVAssetReader        *gReader      = nil;
-static AVAssetReaderTrackOutput *gOutput  = nil;
-static NSMutableSet         *gProxies     = nil;  // strong refs to proxy delegates
+static void vcam_togglePanel(void);
+static void vcam_updatePanelUI(void);
+static void vcam_dismissPanel(void);
+
+// ============================================================
+// Global state
+// ============================================================
+static NSLock                    *gLock       = nil;
+static AVAssetReader             *gReader     = nil;
+static AVAssetReaderTrackOutput  *gOutput     = nil;
+static NSMutableSet              *gProxies    = nil;
+
+// Volume button detection
+static float         gPrevVolume     = -1;
+static NSTimeInterval gLastUpTime    = 0;
+static NSTimeInterval gLastDownTime  = 0;
+
+// UI
+static UIView   *gPanelView    = nil;
+static UISwitch *gEnableSwitch = nil;
+static UILabel  *gVideoLabel   = nil;
+static UILabel  *gStatusLabel  = nil;
 
 // ============================================================
 // Helpers
 // ============================================================
-static BOOL vcam_isEnabled(void) {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    return [fm fileExistsAtPath:VCAM_FLAG] && [fm fileExistsAtPath:VCAM_VIDEO];
+static BOOL vcam_flagExists(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_FLAG];
 }
 
-// Must be called with gLock held.
+static BOOL vcam_videoExists(void) {
+    return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_VIDEO];
+}
+
+static BOOL vcam_isEnabled(void) {
+    return vcam_flagExists() && vcam_videoExists();
+}
+
+static NSString *vcam_videoInfo(void) {
+    if (!vcam_videoExists()) return @"No video selected";
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil];
+    unsigned long long s = a.fileSize;
+    if (s < 1024)        return [NSString stringWithFormat:@"video.mp4 (%llu B)", s];
+    if (s < 1024*1024)   return [NSString stringWithFormat:@"video.mp4 (%.1f KB)", s/1024.0];
+    return [NSString stringWithFormat:@"video.mp4 (%.1f MB)", s/(1024.0*1024.0)];
+}
+
+// ============================================================
+// Video reader
+// ============================================================
 static BOOL vcam_openReader(void) {
     gReader = nil;
     gOutput = nil;
@@ -42,10 +82,8 @@ static BOOL vcam_openReader(void) {
     NSURL *url = [NSURL fileURLWithPath:VCAM_VIDEO];
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url
                                             options:@{AVURLAssetPreferPreciseDurationAndTimingKey: @NO}];
-
     NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
     if (tracks.count == 0) return NO;
-    AVAssetTrack *track = tracks[0];
 
     NSError *err = nil;
     AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
@@ -55,7 +93,7 @@ static BOOL vcam_openReader(void) {
         (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)
     };
     AVAssetReaderTrackOutput *output =
-        [[AVAssetReaderTrackOutput alloc] initWithTrack:track outputSettings:settings];
+        [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks[0] outputSettings:settings];
     output.alwaysCopiesSampleData = NO;
 
     if (![reader canAddOutput:output]) return NO;
@@ -67,22 +105,16 @@ static BOOL vcam_openReader(void) {
     return YES;
 }
 
-// Returns a retained CMSampleBufferRef with retimed presentation timestamp
-// matching |original|, or NULL if replacement is disabled / unavailable.
 static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     if (!vcam_isEnabled()) return NULL;
 
     [gLock lock];
 
-    // Lazily open reader on first call.
-    if (!gReader) {
-        vcam_openReader();
-    }
+    if (!gReader) vcam_openReader();
 
     CMSampleBufferRef frame = nil;
     if (gReader) {
         frame = [gOutput copyNextSampleBuffer];
-        // If video ended, loop from beginning.
         if (!frame || gReader.status != AVAssetReaderStatusReading) {
             gReader = nil;
             gOutput = nil;
@@ -96,27 +128,22 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
 
     if (!frame) return NULL;
 
-    // Retime the frame to match the live camera stream so there are no
-    // timestamp discontinuities downstream.
     CMSampleTimingInfo timing = {
         .duration               = CMSampleBufferGetDuration(original),
         .presentationTimeStamp  = CMSampleBufferGetPresentationTimeStamp(original),
         .decodeTimeStamp        = kCMTimeInvalid
     };
-
     CMSampleBufferRef timedFrame = NULL;
     OSStatus st = CMSampleBufferCreateCopyWithNewTiming(
         kCFAllocatorDefault, frame, 1, &timing, &timedFrame);
     CFRelease(frame);
 
     if (st != noErr || !timedFrame) return NULL;
-    return timedFrame;  // caller must CFRelease
+    return timedFrame;
 }
 
 // ============================================================
-// Proxy delegate
-// Wraps the real AVCaptureVideoDataOutputSampleBufferDelegate
-// and substitutes video frames.
+// Proxy delegate - intercepts camera frames
 // ============================================================
 @interface VCamProxyDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> realDelegate;
@@ -129,17 +156,12 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
     id real = self.realDelegate;
     if (!real) return;
-
     CMSampleBufferRef replaced = vcam_nextFrame(sampleBuffer);
     if (replaced) {
-        [real captureOutput:output
-      didOutputSampleBuffer:replaced
-             fromConnection:connection];
+        [real captureOutput:output didOutputSampleBuffer:replaced fromConnection:connection];
         CFRelease(replaced);
     } else {
-        [real captureOutput:output
-      didOutputSampleBuffer:sampleBuffer
-             fromConnection:connection];
+        [real captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
     }
 }
 
@@ -147,40 +169,356 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
   didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
        fromConnection:(AVCaptureConnection *)connection {
     id real = self.realDelegate;
-    if ([real respondsToSelector:_cmd]) {
-        [real captureOutput:output
-        didDropSampleBuffer:sampleBuffer
-             fromConnection:connection];
-    }
+    if ([real respondsToSelector:_cmd])
+        [real captureOutput:output didDropSampleBuffer:sampleBuffer fromConnection:connection];
 }
 
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    if ([super respondsToSelector:aSelector]) return YES;
-    return [self.realDelegate respondsToSelector:aSelector];
+- (BOOL)respondsToSelector:(SEL)sel {
+    return [super respondsToSelector:sel] || [self.realDelegate respondsToSelector:sel];
 }
 
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    if ([self.realDelegate respondsToSelector:aSelector]) return self.realDelegate;
-    return [super forwardingTargetForSelector:aSelector];
+- (id)forwardingTargetForSelector:(SEL)sel {
+    if ([self.realDelegate respondsToSelector:sel]) return self.realDelegate;
+    return [super forwardingTargetForSelector:sel];
 }
 
 @end
+
+// ============================================================
+// Panel Helper - handles video picking & button actions
+// ============================================================
+@interface VCamPanelHelper : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
++ (instancetype)shared;
+- (void)closePanel;
+- (void)toggleEnabled;
+- (void)pickFromPhotos;
+- (void)pickFromFiles;
+@end
+
+@implementation VCamPanelHelper
+
++ (instancetype)shared {
+    static VCamPanelHelper *inst;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ inst = [[VCamPanelHelper alloc] init]; });
+    return inst;
+}
+
+- (UIViewController *)topVC {
+    UIWindowScene *ws = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) { ws = (UIWindowScene *)s; break; }
+    }
+    UIWindow *win = nil;
+    for (UIWindow *w in ws.windows) {
+        if (w.isKeyWindow) { win = w; break; }
+    }
+    UIViewController *vc = win.rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+- (void)closePanel {
+    vcam_dismissPanel();
+}
+
+- (void)toggleEnabled {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (vcam_flagExists()) {
+        [fm removeItemAtPath:VCAM_FLAG error:nil];
+    } else {
+        [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    // Reset reader when toggling
+    [gLock lock];
+    gReader = nil;
+    gOutput = nil;
+    [gLock unlock];
+    vcam_updatePanelUI();
+}
+
+- (void)pickFromPhotos {
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = [PHPickerFilter videosFilter];
+    cfg.selectionLimit = 1;
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    [[self topVC] presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)pickFromFiles {
+    UTType *movieType = [UTType typeWithIdentifier:@"public.movie"];
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[movieType]];
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    [[self topVC] presentViewController:picker animated:YES completion:nil];
+}
+
+// PHPickerViewControllerDelegate
+- (void)picker:(PHPickerViewController *)picker
+    didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    PHPickerResult *result = results.firstObject;
+    if (!result) return;
+
+    NSItemProvider *provider = result.itemProvider;
+    if (![provider hasItemConformingToTypeIdentifier:@"public.movie"]) return;
+
+    [provider loadFileRepresentationForTypeIdentifier:@"public.movie"
+                                    completionHandler:^(NSURL *url, NSError *err) {
+        if (!url || err) return;
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:VCAM_VIDEO error:nil];
+        [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
+
+        [gLock lock];
+        gReader = nil;
+        gOutput = nil;
+        [gLock unlock];
+
+        dispatch_async(dispatch_get_main_queue(), ^{ vcam_updatePanelUI(); });
+    }];
+}
+
+// UIDocumentPickerDelegate
+- (void)documentPicker:(UIDocumentPickerViewController *)ctrl
+    didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    NSURL *url = urls.firstObject;
+    if (!url) return;
+    BOOL sec = [url startAccessingSecurityScopedResource];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:VCAM_VIDEO error:nil];
+    [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
+    if (sec) [url stopAccessingSecurityScopedResource];
+
+    [gLock lock];
+    gReader = nil;
+    gOutput = nil;
+    [gLock unlock];
+
+    vcam_updatePanelUI();
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)ctrl {}
+
+- (void)bgTapped:(UITapGestureRecognizer *)tap {
+    CGPoint pt = [tap locationInView:gPanelView];
+    // Only dismiss if tapped on the dark background, not the card
+    for (UIView *sub in gPanelView.subviews) {
+        if (CGRectContainsPoint(sub.frame, pt)) return;
+    }
+    vcam_dismissPanel();
+}
+
+@end
+
+// ============================================================
+// Panel UI
+// ============================================================
+static UIButton *vcam_makeButton(NSString *title, UIColor *bg, CGRect frame, SEL action) {
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = frame;
+    [btn setTitle:title forState:UIControlStateNormal];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    btn.backgroundColor = bg;
+    btn.layer.cornerRadius = 8;
+    btn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    [btn addTarget:[VCamPanelHelper shared] action:action forControlEvents:UIControlEventTouchUpInside];
+    return btn;
+}
+
+static void vcam_createPanel(void) {
+    if (gPanelView) return;
+
+    UIWindow *window = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow) { window = w; break; }
+            }
+            if (window) break;
+        }
+    }
+    if (!window) return;
+
+    CGRect sb = window.bounds;
+
+    // Full-screen overlay
+    gPanelView = [[UIView alloc] initWithFrame:sb];
+    gPanelView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+    gPanelView.alpha = 0;
+
+    UITapGestureRecognizer *bgTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:[VCamPanelHelper shared]
+                                                action:@selector(bgTapped:)];
+    [gPanelView addGestureRecognizer:bgTap];
+
+    // Card
+    CGFloat cw = 300, ch = 340;
+    UIView *card = [[UIView alloc] initWithFrame:
+        CGRectMake((sb.size.width - cw)/2, (sb.size.height - ch)/2, cw, ch)];
+    card.backgroundColor = [UIColor colorWithWhite:0.13 alpha:1];
+    card.layer.cornerRadius = 16;
+    card.clipsToBounds = YES;
+    [gPanelView addSubview:card];
+
+    CGFloat y = 16;
+
+    // Title
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw - 70, 30)];
+    title.text = @"VCam Plus";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont boldSystemFontOfSize:20];
+    [card addSubview:title];
+
+    // Close button [X]
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.frame = CGRectMake(cw - 50, y, 40, 30);
+    [closeBtn setTitle:@"X" forState:UIControlStateNormal];
+    [closeBtn setTitleColor:[UIColor colorWithWhite:0.6 alpha:1] forState:UIControlStateNormal];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [closeBtn addTarget:[VCamPanelHelper shared] action:@selector(closePanel)
+       forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:closeBtn];
+    y += 42;
+
+    // Separator
+    UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(16, y, cw - 32, 1)];
+    sep.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
+    [card addSubview:sep];
+    y += 16;
+
+    // Enable row
+    UILabel *enLbl = [[UILabel alloc] initWithFrame:CGRectMake(16, y, 160, 31)];
+    enLbl.text = @"Virtual Camera:";
+    enLbl.textColor = [UIColor whiteColor];
+    enLbl.font = [UIFont systemFontOfSize:16];
+    [card addSubview:enLbl];
+
+    gEnableSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(cw - 67, y, 51, 31)];
+    [gEnableSwitch addTarget:[VCamPanelHelper shared] action:@selector(toggleEnabled)
+            forControlEvents:UIControlEventValueChanged];
+    [card addSubview:gEnableSwitch];
+    y += 44;
+
+    // Status
+    gStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw - 32, 22)];
+    gStatusLabel.font = [UIFont systemFontOfSize:13];
+    [card addSubview:gStatusLabel];
+    y += 28;
+
+    // Video info
+    UILabel *vidTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw - 32, 22)];
+    vidTitle.text = @"Current Video:";
+    vidTitle.textColor = [UIColor colorWithWhite:0.6 alpha:1];
+    vidTitle.font = [UIFont systemFontOfSize:14];
+    [card addSubview:vidTitle];
+    y += 22;
+
+    gVideoLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw - 32, 22)];
+    gVideoLabel.textColor = [UIColor whiteColor];
+    gVideoLabel.font = [UIFont systemFontOfSize:14];
+    [card addSubview:gVideoLabel];
+    y += 36;
+
+    // Buttons
+    UIColor *blue = [UIColor colorWithRed:0.2 green:0.48 blue:1.0 alpha:1];
+    UIColor *gray = [UIColor colorWithWhite:0.28 alpha:1];
+
+    [card addSubview:vcam_makeButton(@"Select from Photos", blue,
+        CGRectMake(16, y, cw - 32, 42), @selector(pickFromPhotos))];
+    y += 50;
+
+    [card addSubview:vcam_makeButton(@"Select from Files", gray,
+        CGRectMake(16, y, cw - 32, 42), @selector(pickFromFiles))];
+
+    vcam_updatePanelUI();
+
+    [window addSubview:gPanelView];
+    [UIView animateWithDuration:0.25 animations:^{ gPanelView.alpha = 1; }];
+}
+
+static void vcam_updatePanelUI(void) {
+    if (!gVideoLabel) return;
+    gVideoLabel.text = vcam_videoInfo();
+    gEnableSwitch.on = vcam_flagExists();
+    if (vcam_isEnabled()) {
+        gStatusLabel.text = @"Status: Active";
+        gStatusLabel.textColor = [UIColor colorWithRed:0.3 green:0.9 blue:0.3 alpha:1];
+    } else if (vcam_videoExists()) {
+        gStatusLabel.text = @"Status: Off";
+        gStatusLabel.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+    } else {
+        gStatusLabel.text = @"Status: No video selected";
+        gStatusLabel.textColor = [UIColor colorWithRed:1.0 green:0.4 blue:0.3 alpha:1];
+    }
+}
+
+static void vcam_dismissPanel(void) {
+    if (!gPanelView) return;
+    [UIView animateWithDuration:0.2 animations:^{
+        gPanelView.alpha = 0;
+    } completion:^(BOOL ok) {
+        [gPanelView removeFromSuperview];
+        gPanelView = nil;
+        gEnableSwitch = nil;
+        gVideoLabel = nil;
+        gStatusLabel = nil;
+    }];
+}
+
+static void vcam_togglePanel(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ vcam_togglePanel(); });
+        return;
+    }
+    if (gPanelView) vcam_dismissPanel();
+    else vcam_createPanel();
+}
+
+// ============================================================
+// Volume button detection
+// Volume Up then Down (or Down then Up) within 0.5s = toggle
+// ============================================================
+static void vcam_volumeChanged(NSNotification *note) {
+    NSString *reason = note.userInfo[@"AVSystemController_AudioVolumeChangeReasonNotificationParameter"];
+    if (![reason isEqualToString:@"ExplicitVolumeChange"]) return;
+
+    float vol = [note.userInfo[@"AVSystemController_AudioVolumeNotificationParameter"] floatValue];
+    NSTimeInterval now = CACurrentMediaTime();
+
+    if (gPrevVolume >= 0) {
+        if (vol > gPrevVolume) {
+            gLastUpTime = now;
+        } else if (vol < gPrevVolume) {
+            gLastDownTime = now;
+        }
+        // Check up+down combo
+        if (gLastUpTime > 0 && gLastDownTime > 0 &&
+            fabs(gLastUpTime - gLastDownTime) < 0.5) {
+            gLastUpTime = 0;
+            gLastDownTime = 0;
+            vcam_togglePanel();
+        }
+    }
+    gPrevVolume = vol;
+}
 
 // ============================================================
 // Hooks
 // ============================================================
 %hook AVCaptureVideoDataOutput
 
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)sampleBufferDelegate
-                          queue:(dispatch_queue_t)sampleBufferCallbackQueue {
-    if (sampleBufferDelegate &&
-        ![sampleBufferDelegate isKindOfClass:[VCamProxyDelegate class]]) {
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
+                          queue:(dispatch_queue_t)queue {
+    if (delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
         VCamProxyDelegate *proxy = [VCamProxyDelegate new];
-        proxy.realDelegate = sampleBufferDelegate;
-        // Keep a strong reference so the proxy is not deallocated while the
-        // delegate is registered (AVCaptureVideoDataOutput only holds weak ref).
+        proxy.realDelegate = delegate;
         [gProxies addObject:proxy];
-        %orig(proxy, sampleBufferCallbackQueue);
+        %orig(proxy, queue);
     } else {
         %orig;
     }
@@ -193,14 +531,24 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 // ============================================================
 %ctor {
     @autoreleasepool {
-        gLock   = [[NSLock alloc] init];
+        gLock    = [[NSLock alloc] init];
         gProxies = [NSMutableSet new];
 
-        // Create the cache directory so the user just needs to drop files in.
         [[NSFileManager defaultManager]
             createDirectoryAtPath:VCAM_DIR
           withIntermediateDirectories:YES
                          attributes:nil
                                error:nil];
+
+        // Volume button detection + UI only in apps (not WebContent)
+        if ([UIApplication sharedApplication]) {
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification"
+                            object:nil
+                             queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                            vcam_volumeChanged(note);
+                        }];
+        }
     }
 }
