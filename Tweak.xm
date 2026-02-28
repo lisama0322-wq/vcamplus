@@ -1,5 +1,5 @@
 // ============================================================
-// VCam Plus v5.5 — Stability fixes + Safari support
+// VCam Plus v5.6 — Crash fixes: safe proxy + safe overlay
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -38,7 +38,6 @@ static void vcam_log(NSString *msg) {
 static NSLock                    *gLock    = nil;
 static AVAssetReader             *gReader  = nil;
 static AVAssetReaderTrackOutput  *gOutput  = nil;
-static NSMutableSet              *gProxies = nil;
 
 static NSTimeInterval gLastUpTime   = 0;
 static NSTimeInterval gLastDownTime = 0;
@@ -60,7 +59,7 @@ static BOOL vcam_isEnabled(void) {
 }
 
 // ============================================================
-// Video reader (shared by overlay + data output proxy)
+// Video reader
 // ============================================================
 static BOOL vcam_openReader(void) {
     @try {
@@ -93,7 +92,6 @@ static BOOL vcam_openReader(void) {
     }
 }
 
-// Read next frame as CMSampleBuffer (for data output proxy)
 static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     if (!vcam_isEnabled()) return NULL;
 
@@ -129,7 +127,6 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     }
 }
 
-// Read next frame as CGImage (for preview overlay)
 static CGImageRef vcam_nextCGImage(void) {
     [gLock lock];
     @try {
@@ -175,13 +172,14 @@ static CGImageRef vcam_nextCGImage(void) {
 }
 
 // ============================================================
-// Overlay controller — renders video frames via timer
+// Overlay controller
 // ============================================================
 @interface VCamOverlay : NSObject
 @property (nonatomic, strong) CALayer *layer;
 @property (nonatomic, weak)   CALayer *previewLayer;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) int frameCount;
+@property (nonatomic, assign) int failCount;
 + (void)attachToPreviewLayer:(CALayer *)previewLayer;
 + (void)removeAll;
 @end
@@ -197,9 +195,8 @@ static NSMutableArray *gOverlays = nil;
         // Check if already has a VALID overlay
         VCamOverlay *existing = objc_getAssociatedObject(previewLayer, &kOverlayKey);
         if (existing) {
-            // If overlay is still in the layer hierarchy, skip
-            if (existing.layer.superlayer) return;
-            // Otherwise, clean up the stale overlay and re-create
+            if (existing.layer.superlayer) return; // Still valid
+            // Stale — clean up
             [existing.timer invalidate];
             [existing.layer removeFromSuperlayer];
             @synchronized(gOverlays) { [gOverlays removeObject:existing]; }
@@ -213,7 +210,7 @@ static NSMutableArray *gOverlays = nil;
         overlay.frame = previewLayer.bounds;
         overlay.contentsGravity = kCAGravityResizeAspectFill;
         overlay.masksToBounds = YES;
-        overlay.backgroundColor = [UIColor blackColor].CGColor;
+        overlay.hidden = YES; // Start hidden, show only when first frame renders
         ctrl.layer = overlay;
 
         CALayer *parent = previewLayer.superlayer;
@@ -236,9 +233,7 @@ static NSMutableArray *gOverlays = nil;
         vcam_log([NSString stringWithFormat:@"Overlay attached, frame=%@, parent=%@",
                   NSStringFromCGRect(previewLayer.bounds),
                   parent ? @"YES" : @"NO"]);
-    } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Overlay attach error: %@", e]);
-    }
+    } @catch (NSException *e) {}
 }
 
 - (void)renderNextFrame {
@@ -246,18 +241,23 @@ static NSMutableArray *gOverlays = nil;
         self.layer.hidden = YES;
         return;
     }
-    self.layer.hidden = NO;
 
-    // If overlay got detached, re-attach
     CALayer *pl = self.previewLayer;
-    if (pl && !self.layer.superlayer) {
+    if (!pl) return;
+
+    // Re-attach if detached
+    if (!self.layer.superlayer) {
         CALayer *parent = pl.superlayer;
         if (parent) {
-            [parent insertSublayer:self.layer above:pl];
+            @try { [parent insertSublayer:self.layer above:pl]; }
+            @catch (NSException *e) { return; }
+        } else {
+            return;
         }
     }
 
-    if (pl && !CGRectEqualToRect(self.layer.frame, pl.bounds)) {
+    // Sync frame size
+    if (!CGRectEqualToRect(self.layer.frame, pl.bounds) && pl.bounds.size.width > 0) {
         self.layer.frame = pl.bounds;
     }
 
@@ -265,9 +265,17 @@ static NSMutableArray *gOverlays = nil;
     if (img) {
         self.layer.contents = (__bridge id)img;
         CGImageRelease(img);
+        self.layer.hidden = NO; // Show only when we have frames
+        self.failCount = 0;
         self.frameCount++;
         if (self.frameCount == 1) {
             vcam_log(@"First overlay frame rendered!");
+        }
+    } else {
+        self.failCount++;
+        // If we can't read frames for 2 seconds (60 attempts), hide overlay
+        if (self.failCount > 60) {
+            self.layer.hidden = YES;
         }
     }
 }
@@ -289,10 +297,10 @@ static NSMutableArray *gOverlays = nil;
 @end
 
 // ============================================================
-// Proxy delegate (for video calling apps)
+// Proxy delegate — STRONG ref, full forwarding
 // ============================================================
 @interface VCamProxyDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-@property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> realDelegate;
+@property (nonatomic, strong) id realDelegate; // strong to prevent dealloc
 @end
 
 @implementation VCamProxyDelegate
@@ -310,7 +318,6 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
             [real captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
         }
     } @catch (NSException *e) {
-        // Fallback: pass original frame
         @try {
             id real = self.realDelegate;
             if (real)
@@ -328,7 +335,9 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     } @catch (NSException *e) {}
 }
 - (BOOL)respondsToSelector:(SEL)sel {
-    return [super respondsToSelector:sel] || [self.realDelegate respondsToSelector:sel];
+    if ([super respondsToSelector:sel]) return YES;
+    id real = self.realDelegate;
+    return real ? [real respondsToSelector:sel] : NO;
 }
 - (id)forwardingTargetForSelector:(SEL)sel {
     id real = self.realDelegate;
@@ -352,6 +361,11 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     } @catch (NSException *e) {}
 }
 @end
+
+// ============================================================
+// Proxy storage — track per-output to allow cleanup
+// ============================================================
+static NSMapTable *gProxyMap = nil; // weak key (output) -> strong value (proxy)
 
 // ============================================================
 // UI Helper
@@ -434,7 +448,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.5"
+        alertControllerWithTitle:@"VCam Plus v5.6"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -533,7 +547,6 @@ static void vcam_showMenu(void) {
 // ============================================================
 %group CamHooks
 
-// Hook 1: Preview layer overlay (direct frame rendering)
 %hook CALayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
@@ -542,36 +555,32 @@ static void vcam_showMenu(void) {
         if (![layer isKindOfClass:gPreviewLayerClass]) return;
         if (!vcam_isEnabled()) return;
         vcam_log(@"PreviewLayer detected!");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @try { [VCamOverlay attachToPreviewLayer:layer]; }
-            @catch (NSException *e) {}
-        });
+        [VCamOverlay attachToPreviewLayer:layer];
     } @catch (NSException *e) {}
 }
 %end
 
-// Hook 2: Data output delegate (for video calling apps & web camera)
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
     @try {
-        if (delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
+        // Only wrap when vcam is enabled — prevents crashes in apps when vcam is off
+        if (vcam_isEnabled() && delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
             vcam_log([NSString stringWithFormat:@"HOOK setSampleBufferDelegate: %@",
                       NSStringFromClass([delegate class])]);
             VCamProxyDelegate *proxy = [VCamProxyDelegate new];
             proxy.realDelegate = delegate;
-            @synchronized(gProxies) { [gProxies addObject:proxy]; }
+            @synchronized(gProxyMap) { [gProxyMap setObject:proxy forKey:self]; }
             %orig(proxy, queue);
             return;
         }
     } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Proxy setup error: %@", e]);
+        vcam_log([NSString stringWithFormat:@"Proxy error: %@", e]);
     }
     %orig;
 }
 %end
 
-// Hook 3: Session tracking
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
@@ -589,7 +598,7 @@ static void vcam_showMenu(void) {
     @autoreleasepool {
         @try {
             gLock     = [[NSLock alloc] init];
-            gProxies  = [NSMutableSet new];
+            gProxyMap = [NSMapTable weakToStrongObjectsMapTable];
             gOverlays = [NSMutableArray new];
 
             [[NSFileManager defaultManager]
