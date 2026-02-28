@@ -6,7 +6,6 @@
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
-#import <MobileCoreServices/MobileCoreServices.h>
 
 #define VCAM_DIR   @"/var/mobile/Library/Caches/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
@@ -257,7 +256,7 @@ static void vcam_showMenu(void) {
             if (!vc) return;
             UIImagePickerController *picker = [[UIImagePickerController alloc] init];
             picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-            picker.mediaTypes = @[(NSString *)kUTTypeMovie];
+            picker.mediaTypes = @[@"public.movie"];
             picker.delegate = [VCamUIHelper shared];
             [vc presentViewController:picker animated:YES completion:nil];
         });
@@ -273,7 +272,7 @@ static void vcam_showMenu(void) {
             if (!vc) return;
             UIDocumentPickerViewController *picker =
                 [[UIDocumentPickerViewController alloc]
-                    initWithDocumentTypes:@[(NSString *)kUTTypeMovie, (NSString *)kUTTypeVideo]
+                    initWithDocumentTypes:@[@"public.movie", @"public.video"]
                                   inMode:UIDocumentPickerModeImport];
             picker.delegate = [VCamUIHelper shared];
             [vc presentViewController:picker animated:YES completion:nil];
