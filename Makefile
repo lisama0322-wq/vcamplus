@@ -5,7 +5,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = vcamplus
 
 vcamplus_FILES      = Tweak.xm
-vcamplus_CFLAGS     = -fobjc-arc
+vcamplus_CFLAGS     = -fobjc-arc -Wno-deprecated-declarations
 vcamplus_FRAMEWORKS = AVFoundation CoreMedia CoreVideo Foundation UIKit MobileCoreServices
 vcamplus_ARCHS      = arm64 arm64e
 
