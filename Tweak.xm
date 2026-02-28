@@ -1,14 +1,14 @@
 // ============================================================
-// VCam Plus v5.3 — Direct frame rendering (no AVPlayer)
+// VCam Plus v5.4 — Fixed paths for rootless sandbox access
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-#define VCAM_DIR   @"/var/tmp/vcamplus"
+#define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
 #define VCAM_FLAG  VCAM_DIR @"/enabled"
-#define VCAM_LOG   @"/var/tmp/vcam_debug.log"
+#define VCAM_LOG   VCAM_DIR @"/debug.log"
 
 static void vcam_showMenu(void);
 
@@ -371,7 +371,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.3"
+        alertControllerWithTitle:@"VCam Plus v5.4"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -535,6 +535,4 @@ static void vcam_showMenu(void) {
         if (sbvc) {
             %init(SBHooks);
             vcam_log(@"SBHooks initialized");
-        }
-    }
-}
+ 
