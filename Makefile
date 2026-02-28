@@ -1,6 +1,5 @@
-INSTALL_TARGET_PROCESSES = SpringBoard
-THEOS_PACKAGE_SCHEME     = rootless
-
+INSTALL_TARGET_PROCESSES = SpringBoard                                                                                  THEOS_PACKAGE_SCHEME     = rootless
+TARGET                   = iphone:clang:16.5:14.0                                                                     
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = vcamplus
