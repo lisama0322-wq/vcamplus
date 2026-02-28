@@ -1,0 +1,9 @@
+Package: com.vcamplus.tweak
+Name: VCam Plus
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Virtual camera for iOS 16. Replaces camera in apps and Safari web pages with a video file.
+Author: VCamPlus
+Maintainer: VCamPlus
+Section: Tweaks
+Depends: org.coolstar.ellekit
