@@ -8,7 +8,10 @@
 		<array>
 			<string>com.apple.UIKit</string>
 		</array>
+		<key>Executables</key>
+		<array>
+			<string>WebContent</string>
+		</array>
 	</dict>
 </dict>
 </plist>
-
