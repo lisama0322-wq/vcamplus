@@ -1,5 +1,5 @@
 // ============================================================
-// VCam Plus v5.2 — Preview layer overlay + data output hook
+// VCam Plus v5.3 — Direct frame rendering (no AVPlayer)
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -38,13 +38,9 @@ static AVAssetReader             *gReader  = nil;
 static AVAssetReaderTrackOutput  *gOutput  = nil;
 static NSMutableSet              *gProxies = nil;
 
-// Volume combo
 static NSTimeInterval gLastUpTime   = 0;
 static NSTimeInterval gLastDownTime = 0;
 
-// Preview overlay tracking
-static NSMutableSet *gOverlayLayers = nil;
-static char kVCamOverlayKey;
 static Class gPreviewLayerClass = nil;
 
 // ============================================================
@@ -61,7 +57,7 @@ static BOOL vcam_isEnabled(void) {
 }
 
 // ============================================================
-// Video reader (for data output frame replacement)
+// Video reader (shared by overlay + data output proxy)
 // ============================================================
 static BOOL vcam_openReader(void) {
     gReader = nil; gOutput = nil;
@@ -90,6 +86,7 @@ static BOOL vcam_openReader(void) {
     return YES;
 }
 
+// Read next frame as CMSampleBuffer (for data output proxy)
 static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     if (!vcam_isEnabled()) return NULL;
 
@@ -120,29 +117,80 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
     return (st == noErr) ? timedFrame : NULL;
 }
 
+// Read next frame as CGImage (for preview overlay)
+static CGImageRef vcam_nextCGImage(void) {
+    [gLock lock];
+    if (!gReader || gReader.status != AVAssetReaderStatusReading)
+        vcam_openReader();
+
+    CMSampleBufferRef buf = nil;
+    if (gReader) {
+        buf = [gOutput copyNextSampleBuffer];
+        if (!buf) {
+            if (vcam_openReader())
+                buf = [gOutput copyNextSampleBuffer];
+        }
+    }
+    [gLock unlock];
+    if (!buf) return NULL;
+
+    CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(buf);
+    if (!pixelBuffer) { CFRelease(buf); return NULL; }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    size_t width      = CVPixelBufferGetWidth(pixelBuffer);
+    size_t height     = CVPixelBufferGetHeight(pixelBuffer);
+    size_t bpr        = CVPixelBufferGetBytesPerRow(pixelBuffer);
+    void  *base       = CVPixelBufferGetBaseAddress(pixelBuffer);
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx   = CGBitmapContextCreate(base, width, height, 8, bpr, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGImageRef img     = CGBitmapContextCreateImage(ctx);
+
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    CFRelease(buf);
+
+    return img; // caller must CGImageRelease
+}
+
 // ============================================================
-// Preview layer overlay — AVPlayer on top of camera preview
+// Overlay controller — renders video frames via timer
 // ============================================================
-static void vcam_addOverlay(CALayer *previewLayer) {
+@interface VCamOverlay : NSObject
+@property (nonatomic, strong) CALayer *layer;
+@property (nonatomic, weak)   CALayer *previewLayer;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) int frameCount;
++ (void)attachToPreviewLayer:(CALayer *)previewLayer;
++ (void)removeAll;
+@end
+
+static NSMutableArray *gOverlays = nil;
+
+@implementation VCamOverlay
+
++ (void)attachToPreviewLayer:(CALayer *)previewLayer {
     // Already has overlay?
-    if (objc_getAssociatedObject(previewLayer, &kVCamOverlayKey)) return;
+    static char kKey;
+    if (objc_getAssociatedObject(previewLayer, &kKey)) return;
     if (!vcam_isEnabled()) return;
 
-    NSURL *videoURL = [NSURL fileURLWithPath:VCAM_VIDEO];
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:videoURL];
-    AVQueuePlayer *player = [AVQueuePlayer playerWithPlayerItem:item];
-    player.volume = 0; // Mute
+    VCamOverlay *ctrl = [[VCamOverlay alloc] init];
+    ctrl.previewLayer = previewLayer;
 
-    // Loop video using AVPlayerLooper
-    AVPlayerLooper *looper = [AVPlayerLooper playerLooperWithPlayer:player
-                                                       templateItem:item];
-
-    AVPlayerLayer *overlay = [AVPlayerLayer playerLayerWithPlayer:player];
+    // Create overlay layer
+    CALayer *overlay = [CALayer layer];
     overlay.frame = previewLayer.bounds;
-    overlay.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    overlay.contentsGravity = kCAGravityResizeAspectFill;
+    overlay.masksToBounds = YES;
+    overlay.backgroundColor = [UIColor blackColor].CGColor; // Black until first frame
+    ctrl.layer = overlay;
 
-    // Insert overlay as sublayer of the preview layer's superlayer,
-    // right above the preview layer
+    // Add above preview layer
     CALayer *parent = previewLayer.superlayer;
     if (parent) {
         [parent insertSublayer:overlay above:previewLayer];
@@ -150,26 +198,63 @@ static void vcam_addOverlay(CALayer *previewLayer) {
         [previewLayer addSublayer:overlay];
     }
 
-    [player play];
+    // Start frame timer at ~30fps
+    ctrl.timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) {
+        [ctrl renderNextFrame];
+    }];
 
-    // Store references so they don't get deallocated
-    objc_setAssociatedObject(previewLayer, &kVCamOverlayKey, overlay,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    // Keep looper alive
-    static char kLooperKey;
-    objc_setAssociatedObject(previewLayer, &kLooperKey, looper,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(previewLayer, &kKey, ctrl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @synchronized(gOverlays) { [gOverlays addObject:ctrl]; }
 
-    @synchronized(gOverlayLayers) {
-        [gOverlayLayers addObject:[NSValue valueWithNonretainedObject:previewLayer]];
-    }
-
-    vcam_log([NSString stringWithFormat:@"Overlay added! frame=%@",
-              NSStringFromCGRect(previewLayer.bounds)]);
+    vcam_log([NSString stringWithFormat:@"Overlay attached, frame=%@, parent=%@",
+              NSStringFromCGRect(previewLayer.bounds),
+              parent ? @"YES" : @"NO"]);
 }
 
+- (void)renderNextFrame {
+    if (!vcam_isEnabled()) {
+        self.layer.hidden = YES;
+        return;
+    }
+    self.layer.hidden = NO;
+
+    // Keep frame in sync with preview layer
+    CALayer *pl = self.previewLayer;
+    if (pl && !CGRectEqualToRect(self.layer.frame, pl.bounds)) {
+        self.layer.frame = pl.bounds;
+    }
+
+    CGImageRef img = vcam_nextCGImage();
+    if (img) {
+        self.layer.contents = (__bridge id)img;
+        CGImageRelease(img);
+        self.frameCount++;
+        if (self.frameCount == 1) {
+            vcam_log(@"First overlay frame rendered!");
+        }
+    }
+}
+
++ (void)removeAll {
+    @synchronized(gOverlays) {
+        for (VCamOverlay *ctrl in gOverlays) {
+            [ctrl.timer invalidate];
+            [ctrl.layer removeFromSuperlayer];
+        }
+        [gOverlays removeAllObjects];
+    }
+}
+
+- (void)dealloc {
+    [_timer invalidate];
+}
+
+@end
+
 // ============================================================
-// Proxy delegate (for apps using AVCaptureVideoDataOutput)
+// Proxy delegate (for video calling apps)
 // ============================================================
 @interface VCamProxyDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> realDelegate;
@@ -229,7 +314,7 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
     [fm removeItemAtPath:VCAM_VIDEO error:nil];
     [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
     [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    vcam_log([NSString stringWithFormat:@"Video selected, flagExists=%d videoExists=%d",
+    vcam_log([NSString stringWithFormat:@"Video selected, flag=%d video=%d",
               vcam_flagExists(), vcam_videoExists()]);
     [gLock lock]; gReader = nil; gOutput = nil; [gLock unlock];
 }
@@ -246,8 +331,6 @@ didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey, id> 
     [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
     if (sec) [url stopAccessingSecurityScopedResource];
     [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    vcam_log([NSString stringWithFormat:@"Video selected (files), flagExists=%d videoExists=%d",
-              vcam_flagExists(), vcam_videoExists()]);
     [gLock lock]; gReader = nil; gOutput = nil; [gLock unlock];
 }
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)ctrl {}
@@ -280,48 +363,41 @@ static void vcam_showMenu(void) {
 
     BOOL enabled = vcam_flagExists();
     BOOL hasVideo = vcam_videoExists();
-
     NSString *videoInfo = @"无";
     if (hasVideo) {
         NSDictionary *attrs = [[NSFileManager defaultManager]
             attributesOfItemAtPath:VCAM_VIDEO error:nil];
-        long long sz = [attrs fileSize];
-        videoInfo = [NSString stringWithFormat:@"%.1f MB", sz / 1048576.0];
+        videoInfo = [NSString stringWithFormat:@"%.1f MB", [attrs fileSize] / 1048576.0];
     }
 
-    NSString *status = [NSString stringWithFormat:
-        @"开关: %@\n视频: %@",
-        enabled ? @"已开启" : @"已关闭", videoInfo];
-
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.2"
-                         message:status
+        alertControllerWithTitle:@"VCam Plus v5.3"
+                         message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
+                                  enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"从相册选择视频"
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIViewController *vc = vcam_topVC();
-            if (!vc) return;
-            UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-            picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-            picker.mediaTypes = @[@"public.movie"];
-            picker.delegate = [VCamUIHelper shared];
-            [vc presentViewController:picker animated:YES completion:nil];
+            UIViewController *vc = vcam_topVC(); if (!vc) return;
+            UIImagePickerController *p = [[UIImagePickerController alloc] init];
+            p.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
+            p.mediaTypes = @[@"public.movie"];
+            p.delegate = [VCamUIHelper shared];
+            [vc presentViewController:p animated:YES completion:nil];
         });
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"从文件选择视频"
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIViewController *vc = vcam_topVC();
-            if (!vc) return;
-            UIDocumentPickerViewController *picker =
+            UIViewController *vc = vcam_topVC(); if (!vc) return;
+            UIDocumentPickerViewController *p =
                 [[UIDocumentPickerViewController alloc]
                     initWithDocumentTypes:@[@"public.movie", @"public.video"]
                                   inMode:UIDocumentPickerModeImport];
-            picker.delegate = [VCamUIHelper shared];
-            [vc presentViewController:picker animated:YES completion:nil];
+            p.delegate = [VCamUIHelper shared];
+            [vc presentViewController:p animated:YES completion:nil];
         });
     }]];
 
@@ -343,11 +419,11 @@ static void vcam_showMenu(void) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *log = [NSString stringWithContentsOfFile:VCAM_LOG
                                                      encoding:NSUTF8StringEncoding error:nil];
-            if (!log || log.length == 0) log = @"(日志为空)";
+            if (!log || log.length == 0) log = @"(空)";
             if (log.length > 2000) log = [log substringFromIndex:log.length - 2000];
             UIAlertController *la = [UIAlertController alertControllerWithTitle:@"诊断日志"
                 message:log preferredStyle:UIAlertControllerStyleAlert];
-            [la addAction:[UIAlertAction actionWithTitle:@"清除日志"
+            [la addAction:[UIAlertAction actionWithTitle:@"清除"
                 style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a2) {
                 [@"" writeToFile:VCAM_LOG atomically:YES encoding:NSUTF8StringEncoding error:nil];
             }]];
@@ -364,10 +440,9 @@ static void vcam_showMenu(void) {
 }
 
 // ============================================================
-// SpringBoard hooks — volume buttons
+// SpringBoard hooks
 // ============================================================
 %group SBHooks
-
 %hook SBVolumeControl
 - (void)increaseVolume {
     %orig;
@@ -388,33 +463,31 @@ static void vcam_showMenu(void) {
     }
 }
 %end
-
 %end
 
 // ============================================================
-// Camera hooks — preview overlay + data output replacement
+// Camera hooks
 // ============================================================
 %group CamHooks
 
-// Hook 1: Intercept preview layer being added to view hierarchy
+// Hook 1: Preview layer overlay (direct frame rendering)
 %hook CALayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
     if (gPreviewLayerClass && [layer isKindOfClass:gPreviewLayerClass]) {
-        vcam_log(@"AVCaptureVideoPreviewLayer detected in addSublayer!");
-        dispatch_async(dispatch_get_main_queue(), ^{
-            vcam_addOverlay(layer);
-        });
+        vcam_log(@"PreviewLayer detected!");
+        // Attach overlay synchronously
+        [VCamOverlay attachToPreviewLayer:layer];
     }
 }
 %end
 
-// Hook 2: Intercept data output delegate (for video calling apps)
+// Hook 2: Data output delegate (for video calling apps)
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
     if (delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
-        vcam_log([NSString stringWithFormat:@"HOOK setSampleBufferDelegate delegate=%@",
+        vcam_log([NSString stringWithFormat:@"HOOK setSampleBufferDelegate: %@",
                   NSStringFromClass([delegate class])]);
         VCamProxyDelegate *proxy = [VCamProxyDelegate new];
         proxy.realDelegate = delegate;
@@ -426,7 +499,7 @@ static void vcam_showMenu(void) {
 }
 %end
 
-// Hook 3: When session starts running, check for preview layers
+// Hook 3: Session tracking
 %hook AVCaptureSession
 - (void)startRunning {
     %orig;
@@ -441,20 +514,18 @@ static void vcam_showMenu(void) {
 // ============================================================
 %ctor {
     @autoreleasepool {
-        gLock          = [[NSLock alloc] init];
-        gProxies       = [NSMutableSet new];
-        gOverlayLayers = [NSMutableSet new];
+        gLock     = [[NSLock alloc] init];
+        gProxies  = [NSMutableSet new];
+        gOverlays = [NSMutableArray new];
 
         [[NSFileManager defaultManager]
             createDirectoryAtPath:VCAM_DIR
-          withIntermediateDirectories:YES
-                         attributes:nil error:nil];
+          withIntermediateDirectories:YES attributes:nil error:nil];
 
         NSString *proc = [[NSProcessInfo processInfo] processName];
         NSString *bid  = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
         vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
 
-        // Cache the preview layer class
         gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
 
         %init(CamHooks);
