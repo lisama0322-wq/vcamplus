@@ -1,5 +1,5 @@
 // ============================================================
-// VCam Plus v5.6 — Crash fixes: safe proxy + safe overlay
+// VCam Plus v5.7 — Direct method hook (no proxy delegate)
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -44,6 +44,10 @@ static NSTimeInterval gLastDownTime = 0;
 
 static Class gPreviewLayerClass = nil;
 static char  kOverlayKey;
+
+// For dynamic delegate hooking
+static NSMutableDictionary *gOrigIMPs      = nil; // className -> NSValue(IMP)
+static NSMutableSet        *gHookedClasses = nil;
 
 // ============================================================
 // Helpers
@@ -148,22 +152,19 @@ static CGImageRef vcam_nextCGImage(void) {
         if (!pixelBuffer) { CFRelease(buf); return NULL; }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-
-        size_t width      = CVPixelBufferGetWidth(pixelBuffer);
-        size_t height     = CVPixelBufferGetHeight(pixelBuffer);
-        size_t bpr        = CVPixelBufferGetBytesPerRow(pixelBuffer);
-        void  *base       = CVPixelBufferGetBaseAddress(pixelBuffer);
+        size_t width  = CVPixelBufferGetWidth(pixelBuffer);
+        size_t height = CVPixelBufferGetHeight(pixelBuffer);
+        size_t bpr    = CVPixelBufferGetBytesPerRow(pixelBuffer);
+        void  *base   = CVPixelBufferGetBaseAddress(pixelBuffer);
 
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGContextRef ctx   = CGBitmapContextCreate(base, width, height, 8, bpr, cs,
             kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
         CGImageRef img     = CGBitmapContextCreateImage(ctx);
-
         CGContextRelease(ctx);
         CGColorSpaceRelease(cs);
         CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
         CFRelease(buf);
-
         return img;
     } @catch (NSException *e) {
         [gLock unlock];
@@ -192,11 +193,9 @@ static NSMutableArray *gOverlays = nil;
     @try {
         if (!vcam_isEnabled()) return;
 
-        // Check if already has a VALID overlay
         VCamOverlay *existing = objc_getAssociatedObject(previewLayer, &kOverlayKey);
         if (existing) {
-            if (existing.layer.superlayer) return; // Still valid
-            // Stale — clean up
+            if (existing.layer.superlayer) return;
             [existing.timer invalidate];
             [existing.layer removeFromSuperlayer];
             @synchronized(gOverlays) { [gOverlays removeObject:existing]; }
@@ -210,7 +209,7 @@ static NSMutableArray *gOverlays = nil;
         overlay.frame = previewLayer.bounds;
         overlay.contentsGravity = kCAGravityResizeAspectFill;
         overlay.masksToBounds = YES;
-        overlay.hidden = YES; // Start hidden, show only when first frame renders
+        overlay.hidden = YES;
         ctrl.layer = overlay;
 
         CALayer *parent = previewLayer.superlayer;
@@ -237,26 +236,19 @@ static NSMutableArray *gOverlays = nil;
 }
 
 - (void)renderNextFrame {
-    if (!vcam_isEnabled()) {
-        self.layer.hidden = YES;
-        return;
-    }
+    if (!vcam_isEnabled()) { self.layer.hidden = YES; return; }
 
     CALayer *pl = self.previewLayer;
     if (!pl) return;
 
-    // Re-attach if detached
     if (!self.layer.superlayer) {
         CALayer *parent = pl.superlayer;
         if (parent) {
             @try { [parent insertSublayer:self.layer above:pl]; }
             @catch (NSException *e) { return; }
-        } else {
-            return;
-        }
+        } else { return; }
     }
 
-    // Sync frame size
     if (!CGRectEqualToRect(self.layer.frame, pl.bounds) && pl.bounds.size.width > 0) {
         self.layer.frame = pl.bounds;
     }
@@ -265,18 +257,13 @@ static NSMutableArray *gOverlays = nil;
     if (img) {
         self.layer.contents = (__bridge id)img;
         CGImageRelease(img);
-        self.layer.hidden = NO; // Show only when we have frames
+        self.layer.hidden = NO;
         self.failCount = 0;
         self.frameCount++;
-        if (self.frameCount == 1) {
-            vcam_log(@"First overlay frame rendered!");
-        }
+        if (self.frameCount == 1) vcam_log(@"First overlay frame rendered!");
     } else {
         self.failCount++;
-        // If we can't read frames for 2 seconds (60 attempts), hide overlay
-        if (self.failCount > 60) {
-            self.layer.hidden = YES;
-        }
+        if (self.failCount > 60) self.layer.hidden = YES;
     }
 }
 
@@ -290,82 +277,79 @@ static NSMutableArray *gOverlays = nil;
     }
 }
 
-- (void)dealloc {
-    [_timer invalidate];
+- (void)dealloc { [_timer invalidate]; }
+
+@end
+
+// ============================================================
+// Dynamic delegate method hooking (replaces proxy approach)
+// Instead of replacing the delegate object, we hook the
+// delegate CLASS's method directly. The app never sees a
+// different delegate — only the method implementation changes.
+// ============================================================
+typedef void (*CaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
+
+static void vcam_hooked_captureOutput(id self, SEL _cmd, AVCaptureOutput *output,
+                                       CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+    @try {
+        // Look up the original IMP for this class
+        NSString *className = NSStringFromClass([self class]);
+        NSValue *impVal = nil;
+        @synchronized(gOrigIMPs) { impVal = gOrigIMPs[className]; }
+        CaptureOutputIMP origIMP = impVal ? (CaptureOutputIMP)[impVal pointerValue] : NULL;
+
+        if (!origIMP) return;
+
+        if (vcam_isEnabled()) {
+            CMSampleBufferRef replaced = vcam_nextFrame(sampleBuffer);
+            if (replaced) {
+                origIMP(self, _cmd, output, replaced, connection);
+                CFRelease(replaced);
+                return;
+            }
+        }
+        origIMP(self, _cmd, output, sampleBuffer, connection);
+    } @catch (NSException *e) {}
 }
 
-@end
-
-// ============================================================
-// Proxy delegate — STRONG ref, full forwarding
-// ============================================================
-@interface VCamProxyDelegate : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
-@property (nonatomic, strong) id realDelegate; // strong to prevent dealloc
-@end
-
-@implementation VCamProxyDelegate
-- (void)captureOutput:(AVCaptureOutput *)output
-didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
-       fromConnection:(AVCaptureConnection *)connection {
+// Hook a delegate class's captureOutput:didOutputSampleBuffer:fromConnection: method
+static void vcam_hookDelegateClass(Class delegateClass) {
     @try {
-        id real = self.realDelegate;
-        if (!real) return;
-        CMSampleBufferRef replaced = vcam_nextFrame(sampleBuffer);
-        if (replaced) {
-            [real captureOutput:output didOutputSampleBuffer:replaced fromConnection:connection];
-            CFRelease(replaced);
-        } else {
-            [real captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+        NSString *className = NSStringFromClass(delegateClass);
+        @synchronized(gHookedClasses) {
+            if ([gHookedClasses containsObject:className]) return;
         }
+
+        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+
+        // Only hook if this class directly implements the method (not inherited)
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(delegateClass, &count);
+        BOOL found = NO;
+        for (unsigned int i = 0; i < count; i++) {
+            if (method_getName(methods[i]) == sel) { found = YES; break; }
+        }
+        free(methods);
+
+        if (!found) return; // Method is inherited, don't hook to avoid affecting parent class
+
+        Method m = class_getInstanceMethod(delegateClass, sel);
+        if (!m) return;
+
+        IMP origIMP = method_setImplementation(m, (IMP)vcam_hooked_captureOutput);
+
+        @synchronized(gOrigIMPs) {
+            gOrigIMPs[className] = [NSValue valueWithPointer:origIMP];
+        }
+        @synchronized(gHookedClasses) {
+            [gHookedClasses addObject:className];
+        }
+
+        vcam_log([NSString stringWithFormat:@"Hooked delegate: %@", className]);
     } @catch (NSException *e) {
-        @try {
-            id real = self.realDelegate;
-            if (real)
-                [real captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
-        } @catch (NSException *e2) {}
+        vcam_log([NSString stringWithFormat:@"Hook delegate error: %@", e]);
     }
 }
-- (void)captureOutput:(AVCaptureOutput *)output
-  didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer
-       fromConnection:(AVCaptureConnection *)connection {
-    @try {
-        id real = self.realDelegate;
-        if ([real respondsToSelector:_cmd])
-            [real captureOutput:output didDropSampleBuffer:sampleBuffer fromConnection:connection];
-    } @catch (NSException *e) {}
-}
-- (BOOL)respondsToSelector:(SEL)sel {
-    if ([super respondsToSelector:sel]) return YES;
-    id real = self.realDelegate;
-    return real ? [real respondsToSelector:sel] : NO;
-}
-- (id)forwardingTargetForSelector:(SEL)sel {
-    id real = self.realDelegate;
-    if (real && [real respondsToSelector:sel]) return real;
-    return [super forwardingTargetForSelector:sel];
-}
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)sel {
-    NSMethodSignature *sig = [super methodSignatureForSelector:sel];
-    if (!sig) {
-        id real = self.realDelegate;
-        if (real) sig = [real methodSignatureForSelector:sel];
-    }
-    return sig;
-}
-- (void)forwardInvocation:(NSInvocation *)invocation {
-    @try {
-        id real = self.realDelegate;
-        if (real && [real respondsToSelector:invocation.selector]) {
-            [invocation invokeWithTarget:real];
-        }
-    } @catch (NSException *e) {}
-}
-@end
-
-// ============================================================
-// Proxy storage — track per-output to allow cleanup
-// ============================================================
-static NSMapTable *gProxyMap = nil; // weak key (output) -> strong value (proxy)
 
 // ============================================================
 // UI Helper
@@ -448,7 +432,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.6.1"
+        alertControllerWithTitle:@"VCam Plus v5.7"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -563,13 +547,15 @@ static void vcam_showMenu(void) {
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
+    %orig;
     @try {
         if (delegate) {
             vcam_log([NSString stringWithFormat:@"setSampleBufferDelegate: %@",
                       NSStringFromClass([delegate class])]);
+            // Dynamically hook the delegate's class method (not the object)
+            vcam_hookDelegateClass([delegate class]);
         }
     } @catch (NSException *e) {}
-    %orig;
 }
 %end
 
@@ -589,9 +575,10 @@ static void vcam_showMenu(void) {
 %ctor {
     @autoreleasepool {
         @try {
-            gLock     = [[NSLock alloc] init];
-            gProxyMap = [NSMapTable weakToStrongObjectsMapTable];
-            gOverlays = [NSMutableArray new];
+            gLock          = [[NSLock alloc] init];
+            gOverlays      = [NSMutableArray new];
+            gOrigIMPs      = [NSMutableDictionary new];
+            gHookedClasses = [NSMutableSet new];
 
             [[NSFileManager defaultManager]
                 createDirectoryAtPath:VCAM_DIR
