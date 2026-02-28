@@ -535,4 +535,8 @@ static void vcam_showMenu(void) {
         if (sbvc) {
             %init(SBHooks);
             vcam_log(@"SBHooks initialized");
+          }
+      }
+  }
+
  
