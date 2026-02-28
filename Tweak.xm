@@ -448,7 +448,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.6"
+        alertControllerWithTitle:@"VCam Plus v5.6.1"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -564,19 +564,11 @@ static void vcam_showMenu(void) {
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
     @try {
-        // Only wrap when vcam is enabled — prevents crashes in apps when vcam is off
-        if (vcam_isEnabled() && delegate && ![delegate isKindOfClass:[VCamProxyDelegate class]]) {
-            vcam_log([NSString stringWithFormat:@"HOOK setSampleBufferDelegate: %@",
+        if (delegate) {
+            vcam_log([NSString stringWithFormat:@"setSampleBufferDelegate: %@",
                       NSStringFromClass([delegate class])]);
-            VCamProxyDelegate *proxy = [VCamProxyDelegate new];
-            proxy.realDelegate = delegate;
-            @synchronized(gProxyMap) { [gProxyMap setObject:proxy forKey:self]; }
-            %orig(proxy, queue);
-            return;
         }
-    } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Proxy error: %@", e]);
-    }
+    } @catch (NSException *e) {}
     %orig;
 }
 %end
