@@ -12,7 +12,7 @@
 #import <objc/runtime.h>
 
 // CydiaSubstrate (provided by Theos, also compatible with ElleKit/libhooker)
-extern void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
+extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 
 #define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
