@@ -339,7 +339,7 @@ static void vcam_hookDelegateClass(Class delegateClass) {
         IMP origIMP = method_setImplementation(m, (IMP)vcam_hooked_captureOutput);
 
         @synchronized(gOrigIMPs) {
-            gOrigIMPs[className] = [NSValue valueWithPointer:origIMP];
+            gOrigIMPs[className] = [NSValue valueWithPointer:(void *)origIMP];
         }
         @synchronized(gHookedClasses) {
             [gHookedClasses addObject:className];
