@@ -138,19 +138,34 @@ static void vcam_hookClass(Class cls) {
         }
         SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
         Method m = class_getInstanceMethod(cls, sel);
-        if (!m) return;
+        if (!m) {
+            @synchronized(gHookedClasses) { [gHookedClasses removeObject:cn]; }
+            return;
+        }
         IMP cur = method_getImplementation(m);
         class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
         IMP *store = (IMP *)calloc(1, sizeof(IMP));
         if (!store) return;
         *store = cur;
         SEL cs = sel;
+        __block int logCount = 0;
+        NSString *capCN = cn;
         IMP hook = imp_implementationWithBlock(
             ^(id _s, AVCaptureOutput *o, CMSampleBufferRef sb, AVCaptureConnection *c) {
                 @try {
                     OrigCapIMP fn = (OrigCapIMP)(*store);
                     if (!fn) return;
-                    if (vcam_isEnabled()) vcam_replaceInPlace(sb);
+                    if (vcam_isEnabled()) {
+                        BOOL ok = vcam_replaceInPlace(sb);
+                        if (logCount < 3) {
+                            logCount++;
+                            CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+                            OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
+                            vcam_log([NSString stringWithFormat:@"Frame %@: replace=%@ fmt=%u %zux%zu",
+                                capCN, ok ? @"YES" : @"NO", (unsigned)fmt,
+                                pb ? CVPixelBufferGetWidth(pb) : 0, pb ? CVPixelBufferGetHeight(pb) : 0]);
+                        }
+                    }
                     fn(_s, cs, o, sb, c);
                 } @catch (NSException *e) {}
             });
