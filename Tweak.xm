@@ -1,4 +1,4 @@
-// VCam Plus v6.2.9 — Revert preview to addSublayer only
+// VCam Plus v6.3.0 — Fix Safari crash + Web camera replacement
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -8,8 +8,11 @@ extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 #define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
 #define VCAM_FLAG  VCAM_DIR @"/enabled"
+#define VCAM_WEB   VCAM_DIR @"/webmode"
 #define VCAM_LOG   VCAM_DIR @"/debug.log"
 static void vcam_showMenu(void);
+
+static BOOL gIsWebProcess = NO;
 
 static void vcam_log(NSString *msg) {
     @try {
@@ -38,7 +41,16 @@ static CIContext *gCICtx = nil;
 
 static BOOL vcam_flagExists(void) { return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_FLAG]; }
 static BOOL vcam_videoExists(void) { return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_VIDEO]; }
-static BOOL vcam_isEnabled(void) { return vcam_flagExists() && vcam_videoExists(); }
+static BOOL vcam_webMode(void) { return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_WEB]; }
+static BOOL vcam_isEnabled(void) {
+    if (!vcam_flagExists() || !vcam_videoExists()) return NO;
+    BOOL web = vcam_webMode();
+    // Web mode ON: only replace in web processes
+    if (web && !gIsWebProcess) return NO;
+    // Web mode OFF: only replace in app processes
+    if (!web && gIsWebProcess) return NO;
+    return YES;
+}
 
 // --- Video reader ---
 static BOOL vcam_openReader(AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
@@ -356,10 +368,12 @@ static void vcam_showMenu(void) {
     UIViewController *topVC = vcam_topVC();
     if (!topVC || [topVC isKindOfClass:[UIAlertController class]]) return;
     BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
+    BOOL web = vcam_webMode();
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.9"
-        message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
+    NSString *mode = web ? @"网页模式" : @"APP模式";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.0"
+        message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -390,6 +404,23 @@ static void vcam_showMenu(void) {
             [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }]];
     }
+    [a addAction:[UIAlertAction actionWithTitle:web ? @"切换到 APP模式" : @"切换到 网页模式"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+        if (web) {
+            [[NSFileManager defaultManager] removeItemAtPath:VCAM_WEB error:nil];
+        } else {
+            [@"1" writeToFile:VCAM_WEB atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSString *msg = web ?
+                @"已切换到 APP模式\nAPP 立即生效" :
+                @"已切换到 网页模式\n请关闭 Safari 后重新打开";
+            UIAlertController *na = [UIAlertController alertControllerWithTitle:@"模式已切换" message:msg
+                preferredStyle:UIAlertControllerStyleAlert];
+            [na addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+            [vcam_topVC() presentViewController:na animated:YES completion:nil];
+        });
+    }]];
     [a addAction:[UIAlertAction actionWithTitle:@"查看诊断日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *log = [NSString stringWithContentsOfFile:VCAM_LOG encoding:NSUTF8StringEncoding error:nil];
@@ -407,7 +438,41 @@ static void vcam_showMenu(void) {
     [topVC presentViewController:a animated:YES completion:nil];
 }
 
-// --- Hooks (all in default group) ---
+// ============================================================
+// Hooks — separated into groups for web vs app processes
+// ============================================================
+
+// --- CameraHooks: safe for both web and app processes ---
+%group CameraHooks
+
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
+    @try {
+        if (delegate) {
+            Class cls = object_getClass(delegate);
+            NSString *cn = NSStringFromClass(cls);
+            SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+            Method m = class_getInstanceMethod(cls, sel);
+            IMP imp = m ? method_getImplementation(m) : NULL;
+            BOOL isOurs = NO;
+            @synchronized(gHookIMPs) { isOurs = [gHookIMPs containsObject:@((uintptr_t)imp)]; }
+            vcam_log([NSString stringWithFormat:@"setDelegate: %@ IMP=%p ours=%@", cn, imp, isOurs ? @"Y" : @"N"]);
+            vcam_hookClass(cls);
+        }
+    } @catch (NSException *e) {}
+    %orig;
+}
+%end
+
+%hook AVCaptureSession
+- (void)startRunning { %orig; @try { vcam_log(@"AVCaptureSession startRunning"); } @catch (NSException *e) {} }
+%end
+
+%end // CameraHooks
+
+// --- AppHooks: only for native app processes (NOT WebContent) ---
+%group AppHooks
+
 %hook SBVolumeControl
 - (void)increaseVolume {
     %orig;
@@ -436,25 +501,6 @@ static void vcam_showMenu(void) {
         vcam_log(@"PreviewLayer detected");
         [VCamOverlay attachTo:layer];
     } @catch (NSException *e) {}
-}
-%end
-
-%hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
-    @try {
-        if (delegate) {
-            Class cls = object_getClass(delegate);
-            NSString *cn = NSStringFromClass(cls);
-            SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-            Method m = class_getInstanceMethod(cls, sel);
-            IMP imp = m ? method_getImplementation(m) : NULL;
-            BOOL isOurs = NO;
-            @synchronized(gHookIMPs) { isOurs = [gHookIMPs containsObject:@((uintptr_t)imp)]; }
-            vcam_log([NSString stringWithFormat:@"setDelegate: %@ IMP=%p ours=%@", cn, imp, isOurs ? @"Y" : @"N"]);
-            vcam_hookClass(cls);
-        }
-    } @catch (NSException *e) {}
-    %orig;
 }
 %end
 
@@ -495,30 +541,68 @@ static void vcam_showMenu(void) {
 }
 %end
 
-%hook AVCaptureSession
-- (void)startRunning { %orig; @try { vcam_log(@"AVCaptureSession startRunning"); } @catch (NSException *e) {} }
+// Hook AVCaptureStillImageOutput for apps that use the older photo API (e.g. WeChat)
+%hook AVCaptureStillImageOutput
+- (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
+    completionHandler:(void (^)(CMSampleBufferRef, NSError *))handler {
+    @try {
+        if (vcam_isEnabled() && handler) {
+            vcam_log(@"StillImage capture intercepted");
+            void (^origHandler)(CMSampleBufferRef, NSError *) = [handler copy];
+            %orig(connection, ^(CMSampleBufferRef buf, NSError *err) {
+                @try {
+                    if (buf && !err) {
+                        BOOL ok = vcam_replaceInPlace(buf);
+                        vcam_log([NSString stringWithFormat:@"StillImage replace=%@", ok ? @"YES" : @"NO"]);
+                    }
+                } @catch (NSException *e) {}
+                if (origHandler) origHandler(buf, err);
+            });
+            return;
+        }
+    } @catch (NSException *e) {}
+    %orig;
+}
 %end
+
+%end // AppHooks
 
 %ctor {
     @autoreleasepool {
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        gIsWebProcess = [bid hasPrefix:@"com.apple.WebKit"] ||
+                        [proc isEqualToString:@"WebContent"];
+
+        // Web process: skip entirely if web mode is not enabled
+        if (gIsWebProcess && !vcam_webMode()) return;
+
         gLockA = [[NSLock alloc] init];
         gLockB = [[NSLock alloc] init];
         gOverlays = [NSMutableArray new];
         gHookedClasses = [NSMutableSet new];
         gHookIMPs = [NSMutableSet new];
         gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *proc = [[NSProcessInfo processInfo] processName];
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
-        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
-        gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
-        NSArray *known = @[@"IESMMCaptureKit", @"AWECameraAdapter", @"HTSLiveCaptureKit",
-            @"IESLiveCaptureKit", @"IESMMCameraSession"];
-        for (NSString *name in known) {
-            Class cls = NSClassFromString(name);
-            if (cls) vcam_hookClass(cls);
+        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
+            withIntermediateDirectories:YES attributes:nil error:nil];
+
+        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=%@",
+            proc, bid, gIsWebProcess ? @"Y" : @"N"]);
+
+        // Camera hooks: safe for all processes (web + app)
+        %init(CameraHooks);
+
+        if (!gIsWebProcess) {
+            gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
+            NSArray *known = @[@"IESMMCaptureKit", @"AWECameraAdapter", @"HTSLiveCaptureKit",
+                @"IESLiveCaptureKit", @"IESMMCameraSession"];
+            for (NSString *name in known) {
+                Class cls = NSClassFromString(name);
+                if (cls) vcam_hookClass(cls);
+            }
+            %init(AppHooks);
         }
-        %init;
+
         vcam_log(@"Hooks initialized");
     }
 }
