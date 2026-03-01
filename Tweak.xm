@@ -1,4 +1,4 @@
-// VCam Plus v6.2 — In-place pixel replacement via CIContext
+// VCam Plus v6.2.3 — IMP-tracking re-hook for Douyin
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -32,6 +32,7 @@ static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static NSMutableSet *gHookedClasses = nil;
+static NSMutableSet *gHookIMPs = nil;
 static NSMutableArray *gOverlays = nil;
 static CIContext *gCICtx = nil;
 
@@ -132,18 +133,19 @@ static void vcam_hookClass(Class cls) {
     @try {
         if (!cls) return;
         NSString *cn = NSStringFromClass(cls);
-        @synchronized(gHookedClasses) {
-            if ([gHookedClasses containsObject:cn]) return;
-            [gHookedClasses addObject:cn];
-        }
         SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
         Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            @synchronized(gHookedClasses) { [gHookedClasses removeObject:cn]; }
-            return;
-        }
+        if (!m) return;
+        // Check if current IMP is already our hook — skip if so
         IMP cur = method_getImplementation(m);
+        @synchronized(gHookIMPs) {
+            if ([gHookIMPs containsObject:@((uintptr_t)cur)]) return;
+        }
+        // Ensure method exists on this class (not just inherited)
         class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
+        // Re-read IMP after class_addMethod
+        m = class_getInstanceMethod(cls, sel);
+        cur = method_getImplementation(m);
         IMP *store = (IMP *)calloc(1, sizeof(IMP));
         if (!store) return;
         *store = cur;
@@ -170,7 +172,16 @@ static void vcam_hookClass(Class cls) {
                 } @catch (NSException *e) {}
             });
         MSHookMessageEx(cls, sel, hook, store);
-        vcam_log([NSString stringWithFormat:@"Hooked: %@", cn]);
+        // Track our hook IMP so we don't re-hook unnecessarily
+        @synchronized(gHookIMPs) {
+            [gHookIMPs addObject:@((uintptr_t)hook)];
+        }
+        BOOL rehook = NO;
+        @synchronized(gHookedClasses) {
+            rehook = [gHookedClasses containsObject:cn];
+            [gHookedClasses addObject:cn];
+        }
+        vcam_log([NSString stringWithFormat:@"%@: %@", rehook ? @"Re-hooked" : @"Hooked", cn]);
     } @catch (NSException *e) {}
 }
 
@@ -282,11 +293,9 @@ static void vcam_showMenu(void) {
     BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.3"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
-    // version tag for menu
-    a.title = @"VCam Plus v6.2.2";
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *vc = vcam_topVC(); if (!vc) return;
@@ -370,7 +379,13 @@ static void vcam_showMenu(void) {
     @try {
         if (delegate) {
             Class cls = object_getClass(delegate);
-            vcam_log([NSString stringWithFormat:@"setDelegate: %@", NSStringFromClass(cls)]);
+            NSString *cn = NSStringFromClass(cls);
+            SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+            Method m = class_getInstanceMethod(cls, sel);
+            IMP imp = m ? method_getImplementation(m) : NULL;
+            BOOL isOurs = NO;
+            @synchronized(gHookIMPs) { isOurs = [gHookIMPs containsObject:@((uintptr_t)imp)]; }
+            vcam_log([NSString stringWithFormat:@"setDelegate: %@ IMP=%p ours=%@", cn, imp, isOurs ? @"Y" : @"N"]);
             vcam_hookClass(cls);
         }
     } @catch (NSException *e) {}
@@ -397,6 +412,7 @@ static void vcam_showMenu(void) {
         gLockB = [[NSLock alloc] init];
         gOverlays = [NSMutableArray new];
         gHookedClasses = [NSMutableSet new];
+        gHookIMPs = [NSMutableSet new];
         gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
         [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
         NSString *proc = [[NSProcessInfo processInfo] processName];
