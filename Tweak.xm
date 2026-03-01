@@ -1,4 +1,4 @@
-// VCam Plus v6.3.0 — Fix Safari crash + Web camera replacement
+// VCam Plus v6.3.1 — Proxy-based web camera replacement
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -34,6 +34,7 @@ static AVAssetReaderTrackOutput *gOutputA = nil, *gOutputB = nil;
 static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
+static char kProxyKey;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
 static NSMutableArray *gOverlays = nil;
@@ -160,7 +161,7 @@ static CGImageRef vcam_nextCGImage(void) {
     } @catch (NSException *e) { CFRelease(buf); return NULL; }
 }
 
-// --- Hook delegate class (early or dynamic) ---
+// --- Hook delegate class (early or dynamic) — apps only, uses MSHookMessageEx ---
 typedef void (*OrigCapIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
 static void vcam_hookClass(Class cls) {
@@ -170,14 +171,11 @@ static void vcam_hookClass(Class cls) {
         SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
         Method m = class_getInstanceMethod(cls, sel);
         if (!m) return;
-        // Check if current IMP is already our hook — skip if so
         IMP cur = method_getImplementation(m);
         @synchronized(gHookIMPs) {
             if ([gHookIMPs containsObject:@((uintptr_t)cur)]) return;
         }
-        // Ensure method exists on this class (not just inherited)
         class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
-        // Re-read IMP after class_addMethod
         m = class_getInstanceMethod(cls, sel);
         cur = method_getImplementation(m);
         IMP *store = (IMP *)calloc(1, sizeof(IMP));
@@ -206,7 +204,6 @@ static void vcam_hookClass(Class cls) {
                 } @catch (NSException *e) {}
             });
         MSHookMessageEx(cls, sel, hook, store);
-        // Track our hook IMP so we don't re-hook unnecessarily
         @synchronized(gHookIMPs) {
             [gHookIMPs addObject:@((uintptr_t)hook)];
         }
@@ -261,6 +258,44 @@ static void vcam_hookPhotoDelegate(Class cls) {
         vcam_log([NSString stringWithFormat:@"Photo hook: %@", cn]);
     } @catch (NSException *e) {}
 }
+
+// ============================================================
+// VCamWebProxy — delegate proxy for WebContent process.
+// Avoids MSHookMessageEx which crashes WebKit internals.
+// ============================================================
+@interface VCamWebProxy : NSObject
+@property (nonatomic, strong) id realDelegate;
+@end
+
+@implementation VCamWebProxy
+
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
+    @try {
+        if (vcam_isEnabled() && sb) vcam_replaceInPlace(sb);
+    } @catch (NSException *e) {}
+    @try {
+        if ([self.realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
+            [self.realDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:conn];
+    } @catch (NSException *e) {}
+}
+
+- (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
+    @try {
+        if ([self.realDelegate respondsToSelector:@selector(captureOutput:didDropSampleBuffer:fromConnection:)])
+            [self.realDelegate captureOutput:output didDropSampleBuffer:sb fromConnection:conn];
+    } @catch (NSException *e) {}
+}
+
+- (BOOL)respondsToSelector:(SEL)sel {
+    if ([super respondsToSelector:sel]) return YES;
+    return [self.realDelegate respondsToSelector:sel];
+}
+
+- (id)forwardingTargetForSelector:(SEL)sel {
+    return self.realDelegate;
+}
+
+@end
 
 // --- Overlay ---
 @interface VCamOverlay : NSObject
@@ -372,7 +407,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.0"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.1"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -439,10 +474,39 @@ static void vcam_showMenu(void) {
 }
 
 // ============================================================
-// Hooks — separated into groups for web vs app processes
+// Hooks — three groups: WebHooks, CameraHooks, AppHooks
 // ============================================================
 
-// --- CameraHooks: safe for both web and app processes ---
+// --- WebHooks: for WebContent process only (proxy-based, no MSHookMessageEx) ---
+%group WebHooks
+
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
+    @try {
+        if (delegate && vcam_isEnabled()) {
+            NSString *cn = NSStringFromClass(object_getClass(delegate));
+            VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
+            proxy.realDelegate = delegate;
+            objc_setAssociatedObject(self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            vcam_log([NSString stringWithFormat:@"Web proxy: %@", cn]);
+            %orig(proxy, queue);
+            return;
+        }
+    } @catch (NSException *e) {}
+    %orig;
+}
+%end
+
+%hook AVCaptureSession
+- (void)startRunning {
+    %orig;
+    @try { vcam_log(@"AVCaptureSession startRunning (web)"); } @catch (NSException *e) {}
+}
+%end
+
+%end // WebHooks
+
+// --- CameraHooks: for app processes (uses MSHookMessageEx via vcam_hookClass) ---
 %group CameraHooks
 
 %hook AVCaptureVideoDataOutput
@@ -470,7 +534,7 @@ static void vcam_showMenu(void) {
 
 %end // CameraHooks
 
-// --- AppHooks: only for native app processes (NOT WebContent) ---
+// --- AppHooks: only for native app processes ---
 %group AppHooks
 
 %hook SBVolumeControl
@@ -583,17 +647,18 @@ static void vcam_showMenu(void) {
         gOverlays = [NSMutableArray new];
         gHookedClasses = [NSMutableSet new];
         gHookIMPs = [NSMutableSet new];
-        gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
-            withIntermediateDirectories:YES attributes:nil error:nil];
 
-        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=%@",
-            proc, bid, gIsWebProcess ? @"Y" : @"N"]);
-
-        // Camera hooks: safe for all processes (web + app)
-        %init(CameraHooks);
-
-        if (!gIsWebProcess) {
+        if (gIsWebProcess) {
+            // WebContent: software CIContext, no directory creation
+            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
+            %init(WebHooks);
+        } else {
+            // App: GPU CIContext, full initialization
+            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+            [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
+                withIntermediateDirectories:YES attributes:nil error:nil];
+            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=N", proc, bid]);
             gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
             NSArray *known = @[@"IESMMCaptureKit", @"AWECameraAdapter", @"HTSLiveCaptureKit",
                 @"IESLiveCaptureKit", @"IESMMCameraSession"];
@@ -601,6 +666,7 @@ static void vcam_showMenu(void) {
                 Class cls = NSClassFromString(name);
                 if (cls) vcam_hookClass(cls);
             }
+            %init(CameraHooks);
             %init(AppHooks);
         }
 
