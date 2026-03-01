@@ -618,4 +618,17 @@ static void vcam_showMenu(void) {
               withIntermediateDirectories:YES attributes:nil error:nil];
 
             NSString *proc = [[NSProcessInfo processInfo] processName];
-            NSString *bid  = [[NSBundle mainBund
+            NSString *bid  = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";                                       ───────────vcam_log([NSString─stringWithFormat:@"LOADED in %@ (%@)",─proc,─bid]);────────────────────────────────────
+                                                                                                                                      gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
+
+              %init(CamHooks);
+              vcam_log(@"CamHooks initialized");
+
+              Class sbvc = NSClassFromString(@"SBVolumeControl");
+              if (sbvc) {
+                  %init(SBHooks);
+                  vcam_log(@"SBHooks initialized");
+              }
+          } @catch (NSException *e) {}
+      }
+  }
