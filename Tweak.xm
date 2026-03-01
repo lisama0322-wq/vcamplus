@@ -1,4 +1,4 @@
-// VCam Plus v6.4.0 — Replace MSHookMessageEx with method_setImplementation
+// VCam Plus v6.4.1 — Enable MobileSafari in web mode + diagnostics
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -13,6 +13,7 @@ extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 static void vcam_showMenu(void);
 
 static BOOL gIsWebProcess = NO;
+static BOOL gIsMobileSafari = NO;
 static IMP gOrigSetDelegate = NULL;
 
 static void vcam_log(NSString *msg) {
@@ -46,8 +47,12 @@ static BOOL vcam_webMode(void) { return [[NSFileManager defaultManager] fileExis
 static BOOL vcam_isEnabled(void) {
     if (!vcam_flagExists() || !vcam_videoExists()) return NO;
     BOOL web = vcam_webMode();
-    if (web && !gIsWebProcess) return NO;
-    if (!web && gIsWebProcess) return NO;
+    if (web) {
+        // Web mode: enable in WebContent AND MobileSafari (camera capture may happen in either)
+        return gIsWebProcess || gIsMobileSafari;
+    }
+    // App mode: disable in web processes
+    if (gIsWebProcess) return NO;
     return YES;
 }
 
@@ -428,7 +433,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.4.0"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.4.1"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -649,6 +654,7 @@ static void vcam_showMenu(void) {
 
         gIsWebProcess = [bid containsString:@"WebContent"] ||
                         [proc containsString:@"WebContent"];
+        gIsMobileSafari = [bid isEqualToString:@"com.apple.mobilesafari"];
 
         // Web process: skip entirely if web mode is not enabled
         if (gIsWebProcess && !vcam_webMode()) return;
@@ -679,8 +685,8 @@ static void vcam_showMenu(void) {
             gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
             [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
                 withIntermediateDirectories:YES attributes:nil error:nil];
-            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=N webmode=%@",
-                proc, bid, vcam_webMode() ? @"Y" : @"N"]);
+            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=N webmode=%@ safari=%@",
+                proc, bid, vcam_webMode() ? @"Y" : @"N", gIsMobileSafari ? @"Y" : @"N"]);
             gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
             NSArray *known = @[@"IESMMCaptureKit", @"AWECameraAdapter", @"HTSLiveCaptureKit",
                 @"IESLiveCaptureKit", @"IESMMCameraSession"];
