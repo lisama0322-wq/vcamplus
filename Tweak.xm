@@ -544,12 +544,12 @@ static void vcam_showMenu(void) {
 // Hook AVCaptureStillImageOutput for apps that use the older photo API (e.g. WeChat)
 %hook AVCaptureStillImageOutput
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
-    completionHandler:(void (^)(CMSampleBufferRef, NSError *))handler {
+    completionHandler:(void (^)(CMSampleBufferRef imageDataSampleBuffer, NSError *error))handler {
     @try {
         if (vcam_isEnabled() && handler) {
             vcam_log(@"StillImage capture intercepted");
             void (^origHandler)(CMSampleBufferRef, NSError *) = [handler copy];
-            %orig(connection, ^(CMSampleBufferRef buf, NSError *err) {
+            void (^wrapper)(CMSampleBufferRef, NSError *) = ^(CMSampleBufferRef buf, NSError *err) {
                 @try {
                     if (buf && !err) {
                         BOOL ok = vcam_replaceInPlace(buf);
@@ -557,7 +557,8 @@ static void vcam_showMenu(void) {
                     }
                 } @catch (NSException *e) {}
                 if (origHandler) origHandler(buf, err);
-            });
+            };
+            %orig(connection, wrapper);
             return;
         }
     } @catch (NSException *e) {}
