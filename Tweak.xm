@@ -1,4 +1,4 @@
-// VCam Plus v6.3.6 — Proxy-based web replacement + overlay diagnostics
+// VCam Plus v6.3.7 — Always install web proxy + diagnostic logging
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -410,7 +410,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.6"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.7"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -652,13 +652,15 @@ static void vcam_showMenu(void) {
             if (sdMethod) {
                 gOrigSetDelegate = method_getImplementation(sdMethod);
                 IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
-                    if (delegate && vcam_isEnabled()) {
+                    // Always log — diagnostic: confirm this method is called by WebKit
+                    vcam_log([NSString stringWithFormat:@"Web setSBD: %@",
+                        delegate ? NSStringFromClass(object_getClass(delegate)) : @"nil"]);
+                    if (delegate) {
+                        // Always install proxy — let proxy decide per-frame whether to replace
                         VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
                         proxy.realDelegate = delegate;
-                        // Keep proxy alive via associated object on the output
                         objc_setAssociatedObject(_self, "vcam_proxy", proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                        vcam_log([NSString stringWithFormat:@"Web proxy set for: %@",
-                            NSStringFromClass(object_getClass(delegate))]);
+                        vcam_log(@"Web proxy installed");
                         ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, proxy, queue);
                     } else {
                         ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
