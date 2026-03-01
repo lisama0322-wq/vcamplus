@@ -1,4 +1,4 @@
-// VCam Plus v6.3.2 — Pure runtime swizzle for WebContent
+// VCam Plus v6.3.3 — Fix WeChat photo + overlay safety + WebContent diagnostic
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -13,6 +13,7 @@ extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 static void vcam_showMenu(void);
 
 static BOOL gIsWebProcess = NO;
+static IMP gOrigSetDelegate = NULL;
 
 static void vcam_log(NSString *msg) {
     @try {
@@ -35,7 +36,6 @@ static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static char kProxyKey;
-static IMP gOrigSetDelegate = NULL;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
 static NSMutableArray *gOverlays = nil;
@@ -47,9 +47,7 @@ static BOOL vcam_webMode(void) { return [[NSFileManager defaultManager] fileExis
 static BOOL vcam_isEnabled(void) {
     if (!vcam_flagExists() || !vcam_videoExists()) return NO;
     BOOL web = vcam_webMode();
-    // Web mode ON: only replace in web processes
     if (web && !gIsWebProcess) return NO;
-    // Web mode OFF: only replace in app processes
     if (!web && gIsWebProcess) return NO;
     return YES;
 }
@@ -88,10 +86,6 @@ static CMSampleBufferRef vcam_readFrame(NSLock *lock, AVAssetReader *__strong *r
     } @catch (NSException *e) { [lock unlock]; return NULL; }
 }
 
-// ============================================================
-// Render virtual camera frame into any CVPixelBuffer.
-// CIContext handles BGRA->420v/420f format conversion.
-// ============================================================
 static BOOL vcam_replacePixelBuffer(CVPixelBufferRef pixelBuffer) {
     @try {
         if (!gCICtx || !pixelBuffer) return NO;
@@ -122,7 +116,6 @@ static BOOL vcam_replaceInPlace(CMSampleBufferRef sampleBuffer) {
     } @catch (NSException *e) { return NO; }
 }
 
-// --- Generate JPEG from virtual camera frame ---
 static NSData *vcam_currentFrameAsJPEG(void) {
     @try {
         if (!gCICtx) return nil;
@@ -140,7 +133,6 @@ static NSData *vcam_currentFrameAsJPEG(void) {
     } @catch (NSException *e) { return nil; }
 }
 
-// --- CGImage for overlay (Reader B) ---
 static CGImageRef vcam_nextCGImage(void) {
     if (!vcam_isEnabled()) return NULL;
     CMSampleBufferRef buf = vcam_readFrame(gLockB, &gReaderB, &gOutputB);
@@ -162,7 +154,7 @@ static CGImageRef vcam_nextCGImage(void) {
     } @catch (NSException *e) { CFRelease(buf); return NULL; }
 }
 
-// --- Hook delegate class (early or dynamic) — apps only, uses MSHookMessageEx ---
+// --- Hook delegate class (apps only) ---
 typedef void (*OrigCapIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
 static void vcam_hookClass(Class cls) {
@@ -217,7 +209,6 @@ static void vcam_hookClass(Class cls) {
     } @catch (NSException *e) {}
 }
 
-// --- Hook photo capture delegate (AVCapturePhotoCaptureDelegate) ---
 typedef void (*OrigPhotoIMP)(id, SEL, id, id, NSError *);
 
 static void vcam_hookPhotoDelegate(Class cls) {
@@ -260,45 +251,29 @@ static void vcam_hookPhotoDelegate(Class cls) {
     } @catch (NSException *e) {}
 }
 
-// ============================================================
-// VCamWebProxy — delegate proxy for WebContent process.
-// Avoids MSHookMessageEx which crashes WebKit internals.
-// ============================================================
+// --- WebContent proxy (no MSHookMessageEx) ---
 @interface VCamWebProxy : NSObject
 @property (nonatomic, strong) id realDelegate;
 @end
-
 @implementation VCamWebProxy
-
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
-    @try {
-        if (vcam_isEnabled() && sb) vcam_replaceInPlace(sb);
-    } @catch (NSException *e) {}
+    @try { if (vcam_isEnabled() && sb) vcam_replaceInPlace(sb); } @catch (NSException *e) {}
     @try {
         if ([self.realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
             [self.realDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:conn];
     } @catch (NSException *e) {}
 }
-
 - (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
     @try {
         if ([self.realDelegate respondsToSelector:@selector(captureOutput:didDropSampleBuffer:fromConnection:)])
             [self.realDelegate captureOutput:output didDropSampleBuffer:sb fromConnection:conn];
     } @catch (NSException *e) {}
 }
-
-- (BOOL)respondsToSelector:(SEL)sel {
-    if ([super respondsToSelector:sel]) return YES;
-    return [self.realDelegate respondsToSelector:sel];
-}
-
-- (id)forwardingTargetForSelector:(SEL)sel {
-    return self.realDelegate;
-}
-
+- (BOOL)respondsToSelector:(SEL)sel { return [super respondsToSelector:sel] || [self.realDelegate respondsToSelector:sel]; }
+- (id)forwardingTargetForSelector:(SEL)sel { return self.realDelegate; }
 @end
 
-// --- Overlay ---
+// --- Overlay (with auto-cleanup safety) ---
 @interface VCamOverlay : NSObject
 @property (nonatomic, strong) CALayer *layer;
 @property (nonatomic, weak) CALayer *previewLayer;
@@ -348,7 +323,17 @@ static void vcam_hookPhotoDelegate(Class cls) {
     if (img) {
         self.layer.contents = (__bridge id)img; CGImageRelease(img);
         self.layer.hidden = NO; self.failCount = 0;
-    } else { self.failCount++; if (self.failCount > 60) self.layer.hidden = YES; }
+    } else {
+        self.failCount++;
+        if (self.failCount > 60) self.layer.hidden = YES;
+        // Safety: after 3s of failures, remove overlay entirely to prevent black screen
+        if (self.failCount > 90) {
+            [self.layer removeFromSuperlayer];
+            [self.timer invalidate];
+            @synchronized(gOverlays) { [gOverlays removeObject:self]; }
+            vcam_log(@"Overlay auto-removed (no frames)");
+        }
+    }
 }
 - (void)dealloc { [_timer invalidate]; }
 @end
@@ -408,7 +393,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.2"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.3"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -475,10 +460,13 @@ static void vcam_showMenu(void) {
 }
 
 // ============================================================
-// Hooks — CameraHooks + AppHooks (web uses pure runtime swizzle in %ctor)
+// Hooks
 // ============================================================
 
-// --- CameraHooks: for app processes (uses MSHookMessageEx via vcam_hookClass) ---
+// Keep WebHooks group definition (empty) to preserve Logos group numbering
+%group WebHooks
+%end
+
 %group CameraHooks
 
 %hook AVCaptureVideoDataOutput
@@ -506,7 +494,6 @@ static void vcam_showMenu(void) {
 
 %end // CameraHooks
 
-// --- AppHooks: only for native app processes ---
 %group AppHooks
 
 %hook SBVolumeControl
@@ -577,8 +564,8 @@ static void vcam_showMenu(void) {
 }
 %end
 
-// Hook AVCaptureStillImageOutput for apps that use the older photo API (e.g. WeChat)
 %hook AVCaptureStillImageOutput
+// Hook the completion handler for in-place replacement
 - (void)captureStillImageAsynchronouslyFromConnection:(AVCaptureConnection *)connection
     completionHandler:(void (^)(CMSampleBufferRef imageDataSampleBuffer, NSError *error))handler {
     @try {
@@ -599,6 +586,19 @@ static void vcam_showMenu(void) {
         }
     } @catch (NSException *e) {}
     %orig;
+}
+// Hook JPEG extraction — covers WeChat and other apps using JPEG-encoded still images
++ (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)jpegSampleBuffer {
+    @try {
+        if (vcam_isEnabled()) {
+            NSData *data = vcam_currentFrameAsJPEG();
+            if (data) {
+                vcam_log(@"StillImage JPEG replaced");
+                return data;
+            }
+        }
+    } @catch (NSException *e) {}
+    return %orig;
 }
 %end
 
@@ -621,38 +621,28 @@ static void vcam_showMenu(void) {
         gHookIMPs = [NSMutableSet new];
 
         if (gIsWebProcess) {
-            // WebContent: pure ObjC runtime swizzle — NO MSHookMessageEx/Logos
-            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+            // WebContent: diagnostic passthrough — test if swizzle itself is safe
+            // NO CIContext, NO proxy, NO replacement — just pure passthrough
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
 
-            // Swizzle setSampleBufferDelegate:queue: using method_setImplementation
             SEL sdSel = @selector(setSampleBufferDelegate:queue:);
             Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
             if (sdMethod) {
                 gOrigSetDelegate = method_getImplementation(sdMethod);
                 IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
-                    @try {
-                        if (delegate && vcam_isEnabled()) {
-                            NSString *cn = NSStringFromClass(object_getClass(delegate));
-                            VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
-                            proxy.realDelegate = delegate;
-                            objc_setAssociatedObject(_self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            vcam_log([NSString stringWithFormat:@"Web proxy: %@", cn]);
-                            ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, proxy, queue);
-                            return;
-                        }
-                    } @catch (NSException *e) {}
+                    // Pure passthrough — no proxy, no replacement, no file I/O
                     ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
                 });
                 method_setImplementation(sdMethod, newImp);
-                vcam_log(@"Web swizzle: setSampleBufferDelegate OK");
+                vcam_log(@"Web swizzle: passthrough OK");
             }
         } else {
-            // App: GPU CIContext, full initialization
+            // App process: full initialization
             gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
             [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR
                 withIntermediateDirectories:YES attributes:nil error:nil];
-            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=N", proc, bid]);
+            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=N webmode=%@",
+                proc, bid, vcam_webMode() ? @"Y" : @"N"]);
             gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
             NSArray *known = @[@"IESMMCaptureKit", @"AWECameraAdapter", @"HTSLiveCaptureKit",
                 @"IESLiveCaptureKit", @"IESMMCameraSession"];
