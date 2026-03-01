@@ -426,17 +426,17 @@ static void vcam_showMenu(void) {
 // --- Constructor ---
 %ctor {
     @autoreleasepool {
-        @try {
-            gLockA = [[NSLock alloc] init];
-            gLockB = [[NSLock alloc] init];
-            gOverlays = [NSMutableArray new];
-            [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString *proc = [[NSProcessInfo processInfo] processName];
-            NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
-            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
-            gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
-            %init(CamHooks);
-            vcam_log(@"CamHooks initialized");
-            Class sbvc = NSClassFromString(@"SBVolumeControl");
-            if (sbvc) { %init(SBHooks); vcam_log(@"SBHooks initialized"); }
-        }
+        gLockA = [[NSLock alloc] init];
+        gLockB = [[NSLock alloc] init];
+        gOverlays = [NSMutableArray new];
+        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
+        gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
+        %init(CamHooks);
+        vcam_log(@"CamHooks initialized");
+        Class sbvc = NSClassFromString(@"SBVolumeControl");
+        if (sbvc) { %init(SBHooks); vcam_log(@"SBHooks initialized"); }
+    }
+}
