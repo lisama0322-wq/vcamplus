@@ -1,4 +1,4 @@
-// VCam Plus v6.2.5 — CMSampleBuffer replacement for Twitter
+// VCam Plus v6.2.6 — Safe fallback + photo capture for Twitter
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -210,19 +210,6 @@ static void vcam_hookClass(Class cls) {
                     if (!fn) return;
                     if (vcam_isEnabled()) {
                         BOOL ok = vcam_replaceInPlace(sb);
-                        if (!ok) {
-                            // No CVImageBuffer — create replacement buffer
-                            CMSampleBufferRef rep = vcam_createReplacementBuffer(sb);
-                            if (rep) {
-                                if (logCount < 3) {
-                                    logCount++;
-                                    vcam_log([NSString stringWithFormat:@"Frame %@: replaced(new)", capCN]);
-                                }
-                                fn(_s, cs, o, rep, c);
-                                CFRelease(rep);
-                                return;
-                            }
-                        }
                         if (logCount < 3) {
                             logCount++;
                             CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sb);
@@ -400,7 +387,7 @@ static void vcam_showMenu(void) {
     BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.5"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.6"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
