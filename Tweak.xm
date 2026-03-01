@@ -1,4 +1,4 @@
-// VCam Plus v6.3.4 — Web camera replacement via runtime swizzle
+// VCam Plus v6.3.5 — Fix Networking crash + lazy CIContext for WebContent
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -182,6 +182,11 @@ static void vcam_webHookDelegate(id delegate) {
             ^(id _s, AVCaptureOutput *output, CMSampleBufferRef sb, AVCaptureConnection *conn) {
                 @try {
                     if (vcam_isEnabled() && sb) {
+                        // Lazy CIContext creation on first frame
+                        if (!gCICtx) {
+                            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+                            vcam_log(@"Web CIContext created (lazy)");
+                        }
                         BOOL ok = vcam_replaceInPlace(sb);
                         if (logCount < 3) {
                             logCount++;
@@ -439,7 +444,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.4"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.5"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -654,6 +659,10 @@ static void vcam_showMenu(void) {
     @autoreleasepool {
         NSString *proc = [[NSProcessInfo processInfo] processName];
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        // Skip WebKit helper processes (Networking, GPU Process, etc.) entirely
+        BOOL isWebKitHelper = [bid hasPrefix:@"com.apple.WebKit"] && ![bid containsString:@"WebContent"];
+        if (isWebKitHelper) return;
+
         gIsWebProcess = [bid containsString:@"WebContent"] ||
                         [proc containsString:@"WebContent"];
 
@@ -668,9 +677,9 @@ static void vcam_showMenu(void) {
 
         if (gIsWebProcess) {
             // WebContent: swizzle setSampleBufferDelegate to hook delegate's captureOutput
+            // CIContext is created lazily on first frame (not at startup — avoids crash)
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
             gWebHookedIMPs = [NSMutableSet new];
-            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
 
             SEL sdSel = @selector(setSampleBufferDelegate:queue:);
             Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
