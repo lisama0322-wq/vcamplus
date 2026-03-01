@@ -1,4 +1,4 @@
-// VCam Plus v6.2.7 — Full sublayer hook for Twitter preview
+// VCam Plus v6.2.8 — PreviewLayer setSession hook for Twitter
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -358,7 +358,7 @@ static void vcam_showMenu(void) {
     BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.7"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.8"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -427,31 +427,31 @@ static void vcam_showMenu(void) {
 }
 %end
 
-static void vcam_checkPreviewLayer(CALayer *layer) {
-    @try {
-        if (!gPreviewLayerClass || ![layer isKindOfClass:gPreviewLayerClass]) return;
-        if (!vcam_isEnabled()) return;
-        vcam_log(@"PreviewLayer detected");
-        [VCamOverlay attachTo:layer];
-    } @catch (NSException *e) {}
-}
-
 %hook CALayer
 - (void)addSublayer:(CALayer *)layer {
     %orig;
-    vcam_checkPreviewLayer(layer);
+    @try {
+        if (!gPreviewLayerClass || ![layer isKindOfClass:gPreviewLayerClass]) return;
+        if (!vcam_isEnabled()) return;
+        vcam_log(@"PreviewLayer detected (addSublayer)");
+        [VCamOverlay attachTo:layer];
+    } @catch (NSException *e) {}
 }
-- (void)insertSublayer:(CALayer *)layer atIndex:(unsigned)idx {
+%end
+
+%hook AVCaptureVideoPreviewLayer
+- (void)setSession:(AVCaptureSession *)session {
     %orig;
-    vcam_checkPreviewLayer(layer);
-}
-- (void)insertSublayer:(CALayer *)layer below:(CALayer *)sibling {
-    %orig;
-    vcam_checkPreviewLayer(layer);
-}
-- (void)insertSublayer:(CALayer *)layer above:(CALayer *)sibling {
-    %orig;
-    vcam_checkPreviewLayer(layer);
+    @try {
+        if (!session || !vcam_isEnabled()) return;
+        CALayer *pl = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            @try {
+                vcam_log(@"PreviewLayer detected (setSession)");
+                [VCamOverlay attachTo:pl];
+            } @catch (NSException *e) {}
+        });
+    } @catch (NSException *e) {}
 }
 %end
 
