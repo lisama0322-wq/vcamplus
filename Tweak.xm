@@ -126,35 +126,6 @@ static NSData *vcam_currentFrameAsJPEG(void) {
     } @catch (NSException *e) { return nil; }
 }
 
-// --- Create replacement CMSampleBuffer (for buffers without CVImageBuffer) ---
-static CMSampleBufferRef vcam_createReplacementBuffer(CMSampleBufferRef originalSB) {
-    @try {
-        CMSampleBufferRef frame = vcam_readFrame(gLockA, &gReaderA, &gOutputA);
-        if (!frame) return NULL;
-        CVImageBufferRef srcPB = CMSampleBufferGetImageBuffer(frame);
-        if (!srcPB) { CFRelease(frame); return NULL; }
-        // Get timing from original
-        CMSampleTimingInfo timing;
-        memset(&timing, 0, sizeof(timing));
-        OSStatus st = CMSampleBufferGetSampleTimingInfo(originalSB, 0, &timing);
-        if (st != noErr) {
-            timing.duration = kCMTimeInvalid;
-            timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originalSB);
-            timing.decodeTimeStamp = kCMTimeInvalid;
-        }
-        // Create format description from our pixel buffer
-        CMVideoFormatDescriptionRef fmtDesc = NULL;
-        st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, srcPB, &fmtDesc);
-        if (st != noErr || !fmtDesc) { CFRelease(frame); return NULL; }
-        // Create new sample buffer wrapping our pixel buffer
-        CMSampleBufferRef newSB = NULL;
-        st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, srcPB, YES, NULL, NULL, fmtDesc, &timing, &newSB);
-        CFRelease(fmtDesc);
-        CFRelease(frame);
-        return (st == noErr) ? newSB : NULL;
-    } @catch (NSException *e) { return NULL; }
-}
-
 // --- CGImage for overlay (Reader B) ---
 static CGImageRef vcam_nextCGImage(void) {
     if (!vcam_isEnabled()) return NULL;
