@@ -1,4 +1,4 @@
-// VCam Plus v6.3.7 — Always install web proxy + diagnostic logging
+// VCam Plus v6.3.8 — WebKit API diagnostics + overlay tick diagnostics
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -322,6 +322,14 @@ static void vcam_hookPhotoDelegate(Class cls) {
     } @catch (NSException *e) {}
 }
 - (void)tick {
+    static int tickDiag = 0;
+    if (tickDiag < 2) {
+        tickDiag++;
+        vcam_log([NSString stringWithFormat:@"Overlay tick: enabled=%@ flag=%@ video=%@ web=%@ pl=%@",
+            vcam_isEnabled() ? @"Y" : @"N", vcam_flagExists() ? @"Y" : @"N",
+            vcam_videoExists() ? @"Y" : @"N", vcam_webMode() ? @"Y" : @"N",
+            self.previewLayer ? @"Y" : @"nil"]);
+    }
     if (!vcam_isEnabled()) { self.layer.hidden = YES; return; }
     CALayer *pl = self.previewLayer; if (!pl) return;
     if (!self.layer.superlayer) {
@@ -410,7 +418,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.7"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.8"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -642,33 +650,61 @@ static void vcam_showMenu(void) {
         gHookIMPs = [NSMutableSet new];
 
         if (gIsWebProcess) {
-            // WebContent: swizzle setSampleBufferDelegate to intercept with VCamWebProxy
-            // No class_addMethod/method_setImplementation on WebKit classes — just replace delegate with proxy
-            // CIContext created lazily inside proxy on first frame
+            // WebContent: diagnostic — find what AVFoundation API WebKit actually uses
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
 
+            // Diagnostic 1: hook setSampleBufferDelegate (passthrough only, like v6.3.3)
             SEL sdSel = @selector(setSampleBufferDelegate:queue:);
             Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
             if (sdMethod) {
                 gOrigSetDelegate = method_getImplementation(sdMethod);
                 IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
-                    // Always log — diagnostic: confirm this method is called by WebKit
                     vcam_log([NSString stringWithFormat:@"Web setSBD: %@",
                         delegate ? NSStringFromClass(object_getClass(delegate)) : @"nil"]);
-                    if (delegate) {
-                        // Always install proxy — let proxy decide per-frame whether to replace
-                        VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
-                        proxy.realDelegate = delegate;
-                        objc_setAssociatedObject(_self, "vcam_proxy", proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                        vcam_log(@"Web proxy installed");
-                        ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, proxy, queue);
-                    } else {
-                        ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
-                    }
+                    ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
                 });
                 method_setImplementation(sdMethod, newImp);
-                vcam_log(@"Web swizzle: setSampleBufferDelegate OK");
             }
+
+            // Diagnostic 2: hook AVCaptureSession addOutput:
+            SEL aoSel = @selector(addOutput:);
+            Method aoMethod = class_getInstanceMethod(objc_getClass("AVCaptureSession"), aoSel);
+            if (aoMethod) {
+                IMP origAO = method_getImplementation(aoMethod);
+                IMP newAO = imp_implementationWithBlock(^(id _self, id output) {
+                    vcam_log([NSString stringWithFormat:@"Web addOutput: %@",
+                        NSStringFromClass(object_getClass(output))]);
+                    ((void (*)(id, SEL, id))origAO)(_self, aoSel, output);
+                });
+                method_setImplementation(aoMethod, newAO);
+            }
+
+            // Diagnostic 3: hook AVCaptureSession addInput:
+            SEL aiSel = @selector(addInput:);
+            Method aiMethod = class_getInstanceMethod(objc_getClass("AVCaptureSession"), aiSel);
+            if (aiMethod) {
+                IMP origAI = method_getImplementation(aiMethod);
+                IMP newAI = imp_implementationWithBlock(^(id _self, id input) {
+                    vcam_log([NSString stringWithFormat:@"Web addInput: %@",
+                        NSStringFromClass(object_getClass(input))]);
+                    ((void (*)(id, SEL, id))origAI)(_self, aiSel, input);
+                });
+                method_setImplementation(aiMethod, newAI);
+            }
+
+            // Diagnostic 4: hook AVCaptureSession startRunning
+            SEL srSel = @selector(startRunning);
+            Method srMethod = class_getInstanceMethod(objc_getClass("AVCaptureSession"), srSel);
+            if (srMethod) {
+                IMP origSR = method_getImplementation(srMethod);
+                IMP newSR = imp_implementationWithBlock(^(id _self) {
+                    vcam_log(@"Web AVCaptureSession startRunning");
+                    ((void (*)(id, SEL))origSR)(_self, srSel);
+                });
+                method_setImplementation(srMethod, newSR);
+            }
+
+            vcam_log(@"Web diagnostic hooks installed");
         } else {
             // App process: full initialization
             gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
