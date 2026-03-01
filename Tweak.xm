@@ -1,4 +1,4 @@
-// VCam Plus v6.3.9 — Hook + overlay frame diagnostics
+// VCam Plus v6.4.0 — Replace MSHookMessageEx with method_setImplementation
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -180,7 +180,6 @@ static void vcam_hookClass(Class cls) {
             ^(id _s, AVCaptureOutput *o, CMSampleBufferRef sb, AVCaptureConnection *c) {
                 @try {
                     OrigCapIMP fn = (OrigCapIMP)(*store);
-                    // Unconditional log: confirm hook fires + fn validity
                     if (logCount < 3) {
                         logCount++;
                         vcam_log([NSString stringWithFormat:@"HookCall %@: fn=%p enabled=%@",
@@ -191,7 +190,8 @@ static void vcam_hookClass(Class cls) {
                     fn(_s, cs, o, sb, c);
                 } @catch (NSException *e) {}
             });
-        MSHookMessageEx(cls, sel, hook, store);
+        // Use method_setImplementation instead of MSHookMessageEx (ElleKit unreliable)
+        method_setImplementation(m, hook);
         @synchronized(gHookIMPs) {
             [gHookIMPs addObject:@((uintptr_t)hook)];
         }
@@ -238,7 +238,7 @@ static void vcam_hookPhotoDelegate(Class cls) {
                     if (fn) fn(_s, cs, output, photo, error);
                 } @catch (NSException *e) {}
             });
-        MSHookMessageEx(cls, sel, hook, store);
+        method_setImplementation(m, hook);
         @synchronized(gHookIMPs) {
             [gHookIMPs addObject:@((uintptr_t)hook)];
         }
@@ -348,6 +348,11 @@ static void vcam_hookPhotoDelegate(Class cls) {
     if (img) {
         self.layer.contents = (__bridge id)img; CGImageRelease(img);
         self.layer.hidden = NO; self.failCount = 0;
+        // Bring overlay to front — Camera app may add layers on top
+        CALayer *sup = self.layer.superlayer;
+        if (sup && [[sup sublayers] lastObject] != self.layer) {
+            [sup addSublayer:self.layer];
+        }
     } else {
         self.failCount++;
         // Diagnostic: log why overlay is failing on first failure
@@ -423,7 +428,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.9"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.4.0"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
