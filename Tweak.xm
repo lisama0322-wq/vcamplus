@@ -285,6 +285,8 @@ static void vcam_showMenu(void) {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
+    // version tag for menu
+    a.title = @"VCam Plus v6.2.2";
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *vc = vcam_topVC(); if (!vc) return;
@@ -368,8 +370,18 @@ static void vcam_showMenu(void) {
     @try {
         if (delegate) {
             Class cls = object_getClass(delegate);
+            vcam_log([NSString stringWithFormat:@"setDelegate: %@", NSStringFromClass(cls)]);
             vcam_hookClass(cls);
         }
+    } @catch (NSException *e) {}
+    %orig;
+}
+%end
+
+%hook AVSampleBufferDisplayLayer
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sb {
+    @try {
+        if (vcam_isEnabled() && sb) vcam_replaceInPlace(sb);
     } @catch (NSException *e) {}
     %orig;
 }
