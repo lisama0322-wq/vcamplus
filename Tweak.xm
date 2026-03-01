@@ -1,4 +1,4 @@
-// VCam Plus v6.3.3 — Fix WeChat photo + overlay safety + WebContent diagnostic
+// VCam Plus v6.3.4 — Web camera replacement via runtime swizzle
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -37,6 +37,7 @@ static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
+static NSMutableSet *gWebHookedIMPs = nil;
 static NSMutableArray *gOverlays = nil;
 static CIContext *gCICtx = nil;
 
@@ -151,6 +152,52 @@ static CGImageRef vcam_nextCGImage(void) {
         CVPixelBufferUnlockBaseAddress(pxb, kCVPixelBufferLock_ReadOnly);
         CFRelease(buf); return img;
     } @catch (NSException *e) { CFRelease(buf); return NULL; }
+}
+
+// --- Web delegate hook (pure ObjC runtime, no MSHookMessageEx) ---
+static void vcam_webHookDelegate(id delegate) {
+    @try {
+        if (!delegate) return;
+        Class cls = object_getClass(delegate);
+        if (!cls) return;
+        NSString *cn = NSStringFromClass(cls);
+        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            vcam_log([NSString stringWithFormat:@"Web delegate %@: no captureOutput method", cn]);
+            return;
+        }
+        IMP cur = method_getImplementation(m);
+        @synchronized(gWebHookedIMPs) {
+            if ([gWebHookedIMPs containsObject:@((uintptr_t)cur)]) return;
+        }
+        // Ensure method is on this class (not inherited)
+        class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
+        m = class_getInstanceMethod(cls, sel);
+        cur = method_getImplementation(m);
+        IMP origImp = cur;
+        __block int logCount = 0;
+        NSString *capCN = cn;
+        IMP newImp = imp_implementationWithBlock(
+            ^(id _s, AVCaptureOutput *output, CMSampleBufferRef sb, AVCaptureConnection *conn) {
+                @try {
+                    if (vcam_isEnabled() && sb) {
+                        BOOL ok = vcam_replaceInPlace(sb);
+                        if (logCount < 3) {
+                            logCount++;
+                            vcam_log([NSString stringWithFormat:@"Web frame %@: replace=%@", capCN, ok ? @"YES" : @"NO"]);
+                        }
+                    }
+                } @catch (NSException *e) {}
+                ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))origImp)
+                    (_s, sel, output, sb, conn);
+            });
+        method_setImplementation(m, newImp);
+        @synchronized(gWebHookedIMPs) {
+            [gWebHookedIMPs addObject:@((uintptr_t)newImp)];
+        }
+        vcam_log([NSString stringWithFormat:@"Web hooked delegate: %@", cn]);
+    } @catch (NSException *e) {}
 }
 
 // --- Hook delegate class (apps only) ---
@@ -392,7 +439,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.3"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.4"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -607,8 +654,8 @@ static void vcam_showMenu(void) {
     @autoreleasepool {
         NSString *proc = [[NSProcessInfo processInfo] processName];
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
-        gIsWebProcess = [bid hasPrefix:@"com.apple.WebKit"] ||
-                        [proc isEqualToString:@"WebContent"];
+        gIsWebProcess = [bid containsString:@"WebContent"] ||
+                        [proc containsString:@"WebContent"];
 
         // Web process: skip entirely if web mode is not enabled
         if (gIsWebProcess && !vcam_webMode()) return;
@@ -620,20 +667,25 @@ static void vcam_showMenu(void) {
         gHookIMPs = [NSMutableSet new];
 
         if (gIsWebProcess) {
-            // WebContent: diagnostic passthrough — test if swizzle itself is safe
-            // NO CIContext, NO proxy, NO replacement — just pure passthrough
+            // WebContent: swizzle setSampleBufferDelegate to hook delegate's captureOutput
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
+            gWebHookedIMPs = [NSMutableSet new];
+            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
 
             SEL sdSel = @selector(setSampleBufferDelegate:queue:);
             Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
             if (sdMethod) {
                 gOrigSetDelegate = method_getImplementation(sdMethod);
                 IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
-                    // Pure passthrough — no proxy, no replacement, no file I/O
+                    if (delegate) {
+                        NSString *cn = NSStringFromClass(object_getClass(delegate));
+                        vcam_log([NSString stringWithFormat:@"Web setDelegate: %@", cn]);
+                        vcam_webHookDelegate(delegate);
+                    }
                     ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
                 });
                 method_setImplementation(sdMethod, newImp);
-                vcam_log(@"Web swizzle: passthrough OK");
+                vcam_log(@"Web swizzle: setSampleBufferDelegate OK");
             }
         } else {
             // App process: full initialization
