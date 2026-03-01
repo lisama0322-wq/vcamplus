@@ -1,7 +1,8 @@
-// VCam Plus v6.0 — Delegate Proxy (no third-party class modification)
+// VCam Plus v6.1 — Hybrid: early MSHookMessageEx for known classes + proxy for others
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 
 #define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"
 #define VCAM_VIDEO VCAM_DIR @"/video.mp4"
@@ -34,6 +35,7 @@ static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static char kProxyKey;
+static NSMutableSet *gEarlyHooked = nil;
 
 // --- Helpers ---
 static BOOL vcam_flagExists(void) {
@@ -133,12 +135,57 @@ static CGImageRef vcam_nextCGImage(void) {
 }
 
 // ============================================================
-// Delegate Proxy — core of v6.0
-// Instead of hooking third-party delegate classes with MSHookMessageEx,
-// we wrap the real delegate in our own proxy object.
-// This avoids modifying ANY third-party class at runtime.
+// Early hook — hook known delegate classes at load time
+// This matches the original tweak's pattern: MSHookMessageEx at %ctor
+// before the app's own code runs any integrity checks
 // ============================================================
-@interface VCamDelegateProxy : NSObject
+typedef void (*OrigCaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
+
+static void vcam_earlyHookClass(Class cls) {
+    @try {
+        if (!cls) return;
+        NSString *className = NSStringFromClass(cls);
+        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            vcam_log([NSString stringWithFormat:@"Early: no method on %@", className]);
+            return;
+        }
+        IMP currentIMP = method_getImplementation(m);
+        const char *types = method_getTypeEncoding(m);
+        class_addMethod(cls, sel, currentIMP, types);
+        IMP *origStore = (IMP *)calloc(1, sizeof(IMP));
+        if (!origStore) return;
+        *origStore = currentIMP;
+        SEL capturedSel = sel;
+        IMP hookIMP = imp_implementationWithBlock(
+            ^(id _self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+                @try {
+                    OrigCaptureOutputIMP origIMP = (OrigCaptureOutputIMP)(*origStore);
+                    if (!origIMP) return;
+                    if (vcam_isEnabled()) {
+                        CMSampleBufferRef replaced = vcam_nextReplacementBuffer(sampleBuffer);
+                        if (replaced) {
+                            origIMP(_self, capturedSel, output, replaced, connection);
+                            CFRelease(replaced);
+                            return;
+                        }
+                    }
+                    origIMP(_self, capturedSel, output, sampleBuffer, connection);
+                } @catch (NSException *e) {}
+            });
+        MSHookMessageEx(cls, sel, hookIMP, origStore);
+        @synchronized(gEarlyHooked) { [gEarlyHooked addObject:className]; }
+        vcam_log([NSString stringWithFormat:@"Early hooked: %@ (origIMP=%p)", className, (void *)*origStore]);
+    } @catch (NSException *e) {
+        vcam_log([NSString stringWithFormat:@"Early hook error: %@", e]);
+    }
+}
+
+// ============================================================
+// Delegate Proxy — for classes NOT early-hooked
+// ============================================================
+@interface VCamDelegateProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) id realDelegate;
 @end
 
@@ -306,7 +353,7 @@ static void vcam_showMenu(void) {
     BOOL enabled = vcam_flagExists(); BOOL hasVideo = vcam_videoExists();
     NSString *vi = hasVideo ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.0"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.1"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", enabled ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -377,66 +424,3 @@ static void vcam_showMenu(void) {
 %end
 %end
 
-// --- Camera hooks ---
-%group CamHooks
-%hook CALayer
-- (void)addSublayer:(CALayer *)layer {
-    %orig;
-    @try {
-        if (!gPreviewLayerClass || ![layer isKindOfClass:gPreviewLayerClass]) return;
-        if (!vcam_isEnabled()) return;
-        vcam_log(@"PreviewLayer detected");
-        [VCamOverlay attachToPreviewLayer:layer];
-    } @catch (NSException *e) {}
-}
-%end
-
-%hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
-    @try {
-        if (delegate) {
-            VCamDelegateProxy *proxy = [[VCamDelegateProxy alloc] init];
-            proxy.realDelegate = delegate;
-            objc_setAssociatedObject(self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            vcam_log([NSString stringWithFormat:@"Proxy for: %@", NSStringFromClass(object_getClass(delegate))]);
-            %orig((id)proxy, queue);
-            return;
-        }
-    } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Proxy error: %@", e]);
-    }
-    objc_setAssociatedObject(self, &kProxyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    %orig;
-}
-
-- (id)sampleBufferDelegate {
-    @try {
-        VCamDelegateProxy *proxy = objc_getAssociatedObject(self, &kProxyKey);
-        if (proxy && proxy.realDelegate) return proxy.realDelegate;
-    } @catch (NSException *e) {}
-    return %orig;
-}
-%end
-
-%hook AVCaptureSession
-- (void)startRunning { %orig; @try { vcam_log(@"AVCaptureSession startRunning"); } @catch (NSException *e) {} }
-%end
-%end
-
-// --- Constructor ---
-%ctor {
-    @autoreleasepool {
-        gLockA = [[NSLock alloc] init];
-        gLockB = [[NSLock alloc] init];
-        gOverlays = [NSMutableArray new];
-        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
-        NSString *proc = [[NSProcessInfo processInfo] processName];
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
-        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
-        gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
-        %init(CamHooks);
-        vcam_log(@"CamHooks initialized");
-        Class sbvc = NSClassFromString(@"SBVolumeControl");
-        if (sbvc) { %init(SBHooks); vcam_log(@"SBHooks initialized"); }
-    }
-}
