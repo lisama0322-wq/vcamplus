@@ -35,7 +35,6 @@ static AVAssetReaderTrackOutput *gOutputA = nil, *gOutputB = nil;
 static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
-static char kProxyKey;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
 static NSMutableArray *gOverlays = nil;
