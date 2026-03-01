@@ -1,6 +1,6 @@
 Package: com.vcamplus.tweak
 Name: VCam Plus
-Version: 6.3.9
+Version: 6.4.0
 Architecture: iphoneos-arm64
 Description: Virtual camera for iOS 16 with GUI control panel. Volume Up+Down to open. Works in apps and web pages.
 Author: VCamPlus
