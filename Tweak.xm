@@ -47,7 +47,7 @@ static BOOL vcam_isEnabled(void) {
 }
 
 // --- Video reader ---
-static BOOL vcam_openReaderInto(AVAssetReader **rdr, AVAssetReaderTrackOutput **out) {
+static BOOL vcam_openReaderInto(AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
     @try {
         *rdr = nil; *out = nil;
         if (!vcam_videoExists()) return NO;
@@ -69,7 +69,7 @@ static BOOL vcam_openReaderInto(AVAssetReader **rdr, AVAssetReaderTrackOutput **
     } @catch (NSException *e) { return NO; }
 }
 
-static CMSampleBufferRef vcam_readFrame(NSLock *lock, AVAssetReader **rdr, AVAssetReaderTrackOutput **out) {
+static CMSampleBufferRef vcam_readFrame(NSLock *lock, AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
     [lock lock];
     @try {
         if (!*rdr || (*rdr).status != AVAssetReaderStatusReading)
@@ -439,6 +439,4 @@ static void vcam_showMenu(void) {
             vcam_log(@"CamHooks initialized");
             Class sbvc = NSClassFromString(@"SBVolumeControl");
             if (sbvc) { %init(SBHooks); vcam_log(@"SBHooks initialized"); }
-        } @catch (NSException *e) {}
-    }
-}
+        }
