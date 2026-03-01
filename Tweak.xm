@@ -1,4 +1,4 @@
-// VCam Plus v6.1 — Hybrid: early MSHookMessageEx for known classes + proxy for others
+// VCam Plus v6.1 — Hybrid: early MSHookMessageEx + proxy + no %group
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -10,7 +10,6 @@ extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 #define VCAM_LOG   VCAM_DIR @"/debug.log"
 static void vcam_showMenu(void);
 
-// --- Logging ---
 static void vcam_log(NSString *msg) {
     @try {
         NSString *ts = [NSDateFormatter localizedStringFromDate:[NSDate date]
@@ -33,23 +32,16 @@ static AVAssetReader *gReaderA = nil, *gReaderB = nil;
 static AVAssetReaderTrackOutput *gOutputA = nil, *gOutputB = nil;
 static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
-static char kOverlayKey;
-static char kProxyKey;
+static char kOverlayKey, kProxyKey;
 static NSMutableSet *gEarlyHooked = nil;
+static NSMutableArray *gOverlays = nil;
 
-// --- Helpers ---
-static BOOL vcam_flagExists(void) {
-    return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_FLAG];
-}
-static BOOL vcam_videoExists(void) {
-    return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_VIDEO];
-}
-static BOOL vcam_isEnabled(void) {
-    return vcam_flagExists() && vcam_videoExists();
-}
+static BOOL vcam_flagExists(void) { return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_FLAG]; }
+static BOOL vcam_videoExists(void) { return [[NSFileManager defaultManager] fileExistsAtPath:VCAM_VIDEO]; }
+static BOOL vcam_isEnabled(void) { return vcam_flagExists() && vcam_videoExists(); }
 
 // --- Video reader ---
-static BOOL vcam_openReaderInto(AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
+static BOOL vcam_openReader(AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
     @try {
         *rdr = nil; *out = nil;
         if (!vcam_videoExists()) return NO;
@@ -60,8 +52,8 @@ static BOOL vcam_openReaderInto(AVAssetReader *__strong *rdr, AVAssetReaderTrack
         NSError *err = nil;
         AVAssetReader *reader = [[AVAssetReader alloc] initWithAsset:asset error:&err];
         if (!reader || err) return NO;
-        NSDictionary *settings = @{(NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
-        AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks[0] outputSettings:settings];
+        NSDictionary *s = @{(NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
+        AVAssetReaderTrackOutput *output = [[AVAssetReaderTrackOutput alloc] initWithTrack:tracks[0] outputSettings:s];
         output.alwaysCopiesSampleData = NO;
         if (![reader canAddOutput:output]) return NO;
         [reader addOutput:output];
@@ -74,45 +66,37 @@ static BOOL vcam_openReaderInto(AVAssetReader *__strong *rdr, AVAssetReaderTrack
 static CMSampleBufferRef vcam_readFrame(NSLock *lock, AVAssetReader *__strong *rdr, AVAssetReaderTrackOutput *__strong *out) {
     [lock lock];
     @try {
-        if (!*rdr || (*rdr).status != AVAssetReaderStatusReading)
-            vcam_openReaderInto(rdr, out);
+        if (!*rdr || (*rdr).status != AVAssetReaderStatusReading) vcam_openReader(rdr, out);
         CMSampleBufferRef frame = nil;
         if (*rdr) {
             frame = [*out copyNextSampleBuffer];
-            if (!frame) {
-                if (vcam_openReaderInto(rdr, out))
-                    frame = [*out copyNextSampleBuffer];
-            }
+            if (!frame) { if (vcam_openReader(rdr, out)) frame = [*out copyNextSampleBuffer]; }
         }
-        [lock unlock];
-        return frame;
+        [lock unlock]; return frame;
     } @catch (NSException *e) { [lock unlock]; return NULL; }
 }
 
-// --- Replacement buffer (Reader A) ---
-static CMSampleBufferRef vcam_nextReplacementBuffer(CMSampleBufferRef originalBuffer) {
+static CMSampleBufferRef vcam_nextBuffer(CMSampleBufferRef orig) {
     if (!vcam_isEnabled()) return NULL;
     CMSampleBufferRef frame = vcam_readFrame(gLockA, &gReaderA, &gOutputA);
     if (!frame) return NULL;
     @try {
-        CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(frame);
-        if (!pixelBuffer) { CFRelease(frame); return NULL; }
-        CMVideoFormatDescriptionRef formatDesc = NULL;
-        OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
-        if (st != noErr || !formatDesc) { CFRelease(frame); return NULL; }
-        CMSampleTimingInfo timing;
-        timing.duration = CMSampleBufferGetDuration(originalBuffer);
-        timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originalBuffer);
-        timing.decodeTimeStamp = kCMTimeInvalid;
-        CMSampleBufferRef newBuffer = NULL;
-        st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, true, NULL, NULL, formatDesc, &timing, &newBuffer);
-        CFRelease(formatDesc);
-        CFRelease(frame);
-        return (st == noErr) ? newBuffer : NULL;
+        CVImageBufferRef pb = CMSampleBufferGetImageBuffer(frame);
+        if (!pb) { CFRelease(frame); return NULL; }
+        CMVideoFormatDescriptionRef fd = NULL;
+        OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fd);
+        if (st != noErr || !fd) { CFRelease(frame); return NULL; }
+        CMSampleTimingInfo t;
+        t.duration = CMSampleBufferGetDuration(orig);
+        t.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(orig);
+        t.decodeTimeStamp = kCMTimeInvalid;
+        CMSampleBufferRef nb = NULL;
+        st = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pb, true, NULL, NULL, fd, &t, &nb);
+        CFRelease(fd); CFRelease(frame);
+        return (st == noErr) ? nb : NULL;
     } @catch (NSException *e) { CFRelease(frame); return NULL; }
 }
 
-// --- CGImage for overlay (Reader B) ---
 static CGImageRef vcam_nextCGImage(void) {
     if (!vcam_isEnabled()) return NULL;
     CMSampleBufferRef buf = vcam_readFrame(gLockB, &gReaderB, &gOutputB);
@@ -125,115 +109,82 @@ static CGImageRef vcam_nextCGImage(void) {
         size_t bpr = CVPixelBufferGetBytesPerRow(pxb);
         void *base = CVPixelBufferGetBaseAddress(pxb);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+        CGContextRef ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs,
+            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
         CGImageRef img = CGBitmapContextCreateImage(ctx);
         CGContextRelease(ctx); CGColorSpaceRelease(cs);
         CVPixelBufferUnlockBaseAddress(pxb, kCVPixelBufferLock_ReadOnly);
-        CFRelease(buf);
-        return img;
+        CFRelease(buf); return img;
     } @catch (NSException *e) { CFRelease(buf); return NULL; }
 }
 
-// ============================================================
-// Early hook — hook known delegate classes at load time
-// This matches the original tweak's pattern: MSHookMessageEx at %ctor
-// before the app's own code runs any integrity checks
-// ============================================================
-typedef void (*OrigCaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
+// --- Early hook for known classes at load time ---
+typedef void (*OrigCapIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
-static void vcam_earlyHookClass(Class cls) {
+static void vcam_earlyHook(Class cls) {
     @try {
         if (!cls) return;
-        NSString *className = NSStringFromClass(cls);
+        NSString *cn = NSStringFromClass(cls);
         SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
         Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            vcam_log([NSString stringWithFormat:@"Early: no method on %@", className]);
-            return;
-        }
-        IMP currentIMP = method_getImplementation(m);
-        const char *types = method_getTypeEncoding(m);
-        class_addMethod(cls, sel, currentIMP, types);
-        IMP *origStore = (IMP *)calloc(1, sizeof(IMP));
-        if (!origStore) return;
-        *origStore = currentIMP;
-        SEL capturedSel = sel;
-        IMP hookIMP = imp_implementationWithBlock(
-            ^(id _self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+        if (!m) return;
+        IMP cur = method_getImplementation(m);
+        class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
+        IMP *store = (IMP *)calloc(1, sizeof(IMP));
+        if (!store) return;
+        *store = cur;
+        SEL cs = sel;
+        IMP hook = imp_implementationWithBlock(
+            ^(id _s, AVCaptureOutput *o, CMSampleBufferRef sb, AVCaptureConnection *c) {
                 @try {
-                    OrigCaptureOutputIMP origIMP = (OrigCaptureOutputIMP)(*origStore);
-                    if (!origIMP) return;
+                    OrigCapIMP fn = (OrigCapIMP)(*store);
+                    if (!fn) return;
                     if (vcam_isEnabled()) {
-                        CMSampleBufferRef replaced = vcam_nextReplacementBuffer(sampleBuffer);
-                        if (replaced) {
-                            origIMP(_self, capturedSel, output, replaced, connection);
-                            CFRelease(replaced);
-                            return;
-                        }
+                        CMSampleBufferRef r = vcam_nextBuffer(sb);
+                        if (r) { fn(_s, cs, o, r, c); CFRelease(r); return; }
                     }
-                    origIMP(_self, capturedSel, output, sampleBuffer, connection);
+                    fn(_s, cs, o, sb, c);
                 } @catch (NSException *e) {}
             });
-        MSHookMessageEx(cls, sel, hookIMP, origStore);
-        @synchronized(gEarlyHooked) { [gEarlyHooked addObject:className]; }
-        vcam_log([NSString stringWithFormat:@"Early hooked: %@ (origIMP=%p)", className, (void *)*origStore]);
-    } @catch (NSException *e) {
-        vcam_log([NSString stringWithFormat:@"Early hook error: %@", e]);
-    }
+        MSHookMessageEx(cls, sel, hook, store);
+        @synchronized(gEarlyHooked) { [gEarlyHooked addObject:cn]; }
+        vcam_log([NSString stringWithFormat:@"Early hooked: %@", cn]);
+    } @catch (NSException *e) {}
 }
 
-// ============================================================
-// Delegate Proxy — for classes NOT early-hooked
-// ============================================================
+// --- Delegate Proxy for unknown classes ---
 @interface VCamDelegateProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, strong) id realDelegate;
 @end
-
 @implementation VCamDelegateProxy
-
-- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
+- (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
     @try {
         if (vcam_isEnabled()) {
-            CMSampleBufferRef replaced = vcam_nextReplacementBuffer(sampleBuffer);
-            if (replaced) {
-                [self.realDelegate captureOutput:output didOutputSampleBuffer:replaced fromConnection:connection];
-                CFRelease(replaced);
-                return;
-            }
+            CMSampleBufferRef r = vcam_nextBuffer(sb);
+            if (r) { [self.realDelegate captureOutput:output didOutputSampleBuffer:r fromConnection:conn]; CFRelease(r); return; }
         }
-        [self.realDelegate captureOutput:output didOutputSampleBuffer:sampleBuffer fromConnection:connection];
+        [self.realDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:conn];
     } @catch (NSException *e) {}
 }
-
-- (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection {
+- (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
     @try {
         if ([self.realDelegate respondsToSelector:@selector(captureOutput:didDropSampleBuffer:fromConnection:)])
-            [self.realDelegate captureOutput:output didDropSampleBuffer:sampleBuffer fromConnection:connection];
+            [self.realDelegate captureOutput:output didDropSampleBuffer:sb fromConnection:conn];
     } @catch (NSException *e) {}
 }
-
-- (BOOL)respondsToSelector:(SEL)aSelector {
-    if (aSelector == @selector(captureOutput:didOutputSampleBuffer:fromConnection:)) return YES;
-    if (aSelector == @selector(captureOutput:didDropSampleBuffer:fromConnection:))
-        return [self.realDelegate respondsToSelector:aSelector];
-    return [super respondsToSelector:aSelector] || [self.realDelegate respondsToSelector:aSelector];
+- (BOOL)respondsToSelector:(SEL)s {
+    if (s == @selector(captureOutput:didOutputSampleBuffer:fromConnection:)) return YES;
+    return [self.realDelegate respondsToSelector:s];
 }
-
-- (id)forwardingTargetForSelector:(SEL)aSelector {
-    return self.realDelegate;
-}
-
-- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
-    NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
-    if (!sig) sig = [self.realDelegate methodSignatureForSelector:aSelector];
+- (id)forwardingTargetForSelector:(SEL)s { return self.realDelegate; }
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s {
+    NSMethodSignature *sig = [super methodSignatureForSelector:s];
+    if (!sig) sig = [self.realDelegate methodSignatureForSelector:s];
     return sig;
 }
-
-- (void)forwardInvocation:(NSInvocation *)invocation {
-    if ([self.realDelegate respondsToSelector:invocation.selector])
-        [invocation invokeWithTarget:self.realDelegate];
+- (void)forwardInvocation:(NSInvocation *)inv {
+    if ([self.realDelegate respondsToSelector:inv.selector]) [inv invokeWithTarget:self.realDelegate];
 }
-
 @end
 
 // --- Overlay ---
@@ -242,40 +193,38 @@ static void vcam_earlyHookClass(Class cls) {
 @property (nonatomic, weak) CALayer *previewLayer;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) int failCount;
-+ (void)attachToPreviewLayer:(CALayer *)pl;
++ (void)attachTo:(CALayer *)pl;
 @end
-static NSMutableArray *gOverlays = nil;
-
 @implementation VCamOverlay
-+ (void)attachToPreviewLayer:(CALayer *)previewLayer {
++ (void)attachTo:(CALayer *)previewLayer {
     @try {
         if (!vcam_isEnabled()) return;
-        VCamOverlay *existing = objc_getAssociatedObject(previewLayer, &kOverlayKey);
-        if (existing) {
-            if (existing.layer.superlayer) return;
-            [existing.timer invalidate]; [existing.layer removeFromSuperlayer];
-            @synchronized(gOverlays) { [gOverlays removeObject:existing]; }
+        VCamOverlay *ex = objc_getAssociatedObject(previewLayer, &kOverlayKey);
+        if (ex) {
+            if (ex.layer.superlayer) return;
+            [ex.timer invalidate]; [ex.layer removeFromSuperlayer];
+            @synchronized(gOverlays) { [gOverlays removeObject:ex]; }
             objc_setAssociatedObject(previewLayer, &kOverlayKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         VCamOverlay *ctrl = [[VCamOverlay alloc] init];
         ctrl.previewLayer = previewLayer;
-        CALayer *overlay = [CALayer layer];
-        overlay.frame = previewLayer.bounds;
-        overlay.contentsGravity = kCAGravityResizeAspectFill;
-        overlay.masksToBounds = YES; overlay.hidden = YES;
-        ctrl.layer = overlay;
-        CALayer *parent = previewLayer.superlayer;
-        if (parent) [parent insertSublayer:overlay above:previewLayer];
-        else [previewLayer addSublayer:overlay];
+        CALayer *ov = [CALayer layer];
+        ov.frame = previewLayer.bounds;
+        ov.contentsGravity = kCAGravityResizeAspectFill;
+        ov.masksToBounds = YES; ov.hidden = YES;
+        ctrl.layer = ov;
+        CALayer *par = previewLayer.superlayer;
+        if (par) [par insertSublayer:ov above:previewLayer];
+        else [previewLayer addSublayer:ov];
         ctrl.timer = [NSTimer scheduledTimerWithTimeInterval:1.0/30.0 repeats:YES block:^(NSTimer *t) {
-            @try { [ctrl renderNextFrame]; } @catch (NSException *e) {}
+            @try { [ctrl renderNext]; } @catch (NSException *e) {}
         }];
         objc_setAssociatedObject(previewLayer, &kOverlayKey, ctrl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         @synchronized(gOverlays) { [gOverlays addObject:ctrl]; }
         vcam_log(@"Overlay attached");
     } @catch (NSException *e) {}
 }
-- (void)renderNextFrame {
+- (void)renderNext {
     if (!vcam_isEnabled()) { self.layer.hidden = YES; return; }
     CALayer *pl = self.previewLayer; if (!pl) return;
     if (!self.layer.superlayer) {
@@ -300,24 +249,21 @@ static NSMutableArray *gOverlays = nil;
 @end
 @implementation VCamUIHelper
 + (instancetype)shared {
-    static VCamUIHelper *inst; static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [[VCamUIHelper alloc] init]; }); return inst;
+    static VCamUIHelper *i; static dispatch_once_t o;
+    dispatch_once(&o, ^{ i = [[VCamUIHelper alloc] init]; }); return i;
 }
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary *)info {
-    [picker dismissViewControllerAnimated:YES completion:nil];
+- (void)imagePickerController:(UIImagePickerController *)p didFinishPickingMediaWithInfo:(NSDictionary *)info {
+    [p dismissViewControllerAnimated:YES completion:nil];
     NSURL *url = info[UIImagePickerControllerMediaURL]; if (!url) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:VCAM_VIDEO error:nil];
     [fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:VCAM_VIDEO] error:nil];
     [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    vcam_log(@"Video selected from Photos");
     [gLockA lock]; gReaderA = nil; gOutputA = nil; [gLockA unlock];
     [gLockB lock]; gReaderB = nil; gOutputB = nil; [gLockB unlock];
 }
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [picker dismissViewControllerAnimated:YES completion:nil];
-}
-- (void)documentPicker:(UIDocumentPickerViewController *)ctrl didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+- (void)imagePickerControllerDidCancel:(UIImagePickerController *)p { [p dismissViewControllerAnimated:YES completion:nil]; }
+- (void)documentPicker:(UIDocumentPickerViewController *)c didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *url = urls.firstObject; if (!url) return;
     BOOL sec = [url startAccessingSecurityScopedResource];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -328,7 +274,7 @@ static NSMutableArray *gOverlays = nil;
     [gLockA lock]; gReaderA = nil; gOutputA = nil; [gLockA unlock];
     [gLockB lock]; gReaderB = nil; gOutputB = nil; [gLockB unlock];
 }
-- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)ctrl {}
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)c {}
 @end
 
 // --- Menu ---
@@ -350,13 +296,13 @@ static UIViewController *vcam_topVC(void) {
 static void vcam_showMenu(void) {
     UIViewController *topVC = vcam_topVC();
     if (!topVC || [topVC isKindOfClass:[UIAlertController class]]) return;
-    BOOL enabled = vcam_flagExists(); BOOL hasVideo = vcam_videoExists();
-    NSString *vi = hasVideo ? [NSString stringWithFormat:@"%.1f MB",
+    BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
+    NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.1"
-        message:[NSString stringWithFormat:@"开关: %@\n视频: %@", enabled ? @"已开启" : @"已关闭", vi]
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.1"
+        message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *vc = vcam_topVC(); if (!vc) return;
             UIImagePickerController *p = [[UIImagePickerController alloc] init];
@@ -365,7 +311,7 @@ static void vcam_showMenu(void) {
             [vc presentViewController:p animated:YES completion:nil];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"从文件选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [a addAction:[UIAlertAction actionWithTitle:@"从文件选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIViewController *vc = vcam_topVC(); if (!vc) return;
             UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc]
@@ -374,36 +320,35 @@ static void vcam_showMenu(void) {
             [vc presentViewController:p animated:YES completion:nil];
         });
     }]];
-    if (enabled) {
-        [alert addAction:[UIAlertAction actionWithTitle:@"关闭虚拟摄像头" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+    if (en) {
+        [a addAction:[UIAlertAction actionWithTitle:@"关闭虚拟摄像头" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
             [[NSFileManager defaultManager] removeItemAtPath:VCAM_FLAG error:nil];
             [gLockA lock]; gReaderA = nil; gOutputA = nil; [gLockA unlock];
             [gLockB lock]; gReaderB = nil; gOutputB = nil; [gLockB unlock];
         }]];
     } else {
-        [alert addAction:[UIAlertAction actionWithTitle:@"开启虚拟摄像头" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [a addAction:[UIAlertAction actionWithTitle:@"开启虚拟摄像头" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
             [@"1" writeToFile:VCAM_FLAG atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }]];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"查看诊断日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [a addAction:[UIAlertAction actionWithTitle:@"查看诊断日志" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
         dispatch_async(dispatch_get_main_queue(), ^{
             NSString *log = [NSString stringWithContentsOfFile:VCAM_LOG encoding:NSUTF8StringEncoding error:nil];
             if (!log || log.length == 0) log = @"(空)";
             if (log.length > 2000) log = [log substringFromIndex:log.length - 2000];
             UIAlertController *la = [UIAlertController alertControllerWithTitle:@"诊断日志" message:log preferredStyle:UIAlertControllerStyleAlert];
-            [la addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a2) {
+            [la addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x2) {
                 [@"" writeToFile:VCAM_LOG atomically:YES encoding:NSUTF8StringEncoding error:nil];
             }]];
             [la addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
             [vcam_topVC() presentViewController:la animated:YES completion:nil];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [topVC presentViewController:alert animated:YES completion:nil];
+    [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [topVC presentViewController:a animated:YES completion:nil];
 }
 
-// --- SpringBoard hooks ---
-%group SBHooks
+// --- All hooks in default group (no %group needed) ---
 %hook SBVolumeControl
 - (void)increaseVolume {
     %orig;
@@ -422,5 +367,72 @@ static void vcam_showMenu(void) {
     }
 }
 %end
+
+%hook CALayer
+- (void)addSublayer:(CALayer *)layer {
+    %orig;
+    @try {
+        if (!gPreviewLayerClass || ![layer isKindOfClass:gPreviewLayerClass]) return;
+        if (!vcam_isEnabled()) return;
+        vcam_log(@"PreviewLayer detected");
+        [VCamOverlay attachTo:layer];
+    } @catch (NSException *e) {}
+}
 %end
 
+%hook AVCaptureVideoDataOutput
+- (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate queue:(dispatch_queue_t)queue {
+    @try {
+        if (delegate) {
+            NSString *cn = NSStringFromClass(object_getClass(delegate));
+            BOOL hooked = NO;
+            @synchronized(gEarlyHooked) { hooked = [gEarlyHooked containsObject:cn]; }
+            if (hooked) {
+                vcam_log([NSString stringWithFormat:@"Early-hooked: %@", cn]);
+                %orig; return;
+            }
+            VCamDelegateProxy *proxy = [[VCamDelegateProxy alloc] init];
+            proxy.realDelegate = delegate;
+            objc_setAssociatedObject(self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            vcam_log([NSString stringWithFormat:@"Proxy for: %@", cn]);
+            %orig((id)proxy, queue); return;
+        }
+    } @catch (NSException *e) {}
+    objc_setAssociatedObject(self, &kProxyKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    %orig;
+}
+- (id)sampleBufferDelegate {
+    @try {
+        VCamDelegateProxy *p = objc_getAssociatedObject(self, &kProxyKey);
+        if (p && p.realDelegate) return p.realDelegate;
+    } @catch (NSException *e) {}
+    return %orig;
+}
+%end
+
+%hook AVCaptureSession
+- (void)startRunning { %orig; @try { vcam_log(@"AVCaptureSession startRunning"); } @catch (NSException *e) {} }
+%end
+
+// --- Constructor ---
+%ctor {
+    @autoreleasepool {
+        gLockA = [[NSLock alloc] init];
+        gLockB = [[NSLock alloc] init];
+        gOverlays = [NSMutableArray new];
+        gEarlyHooked = [NSMutableSet new];
+        [[NSFileManager defaultManager] createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *proc = [[NSProcessInfo processInfo] processName];
+        NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
+        vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
+        gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
+        NSArray *known = @[@"IESMMCaptureKit", @"XYCameraKit.XYCoreCamera",
+            @"AWECameraAdapter", @"HTSLiveCaptureKit", @"IESLiveCaptureKit"];
+        for (NSString *name in known) {
+            Class cls = NSClassFromString(name);
+            if (cls) vcam_earlyHook(cls);
+        }
+        %init;
+        vcam_log(@"Hooks initialized");
+    }
+}
