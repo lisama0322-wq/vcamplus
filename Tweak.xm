@@ -1,4 +1,4 @@
-// VCam Plus v6.3.1 — Proxy-based web camera replacement
+// VCam Plus v6.3.2 — Pure runtime swizzle for WebContent
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -35,6 +35,7 @@ static NSTimeInterval gLastUpTime = 0, gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static char kProxyKey;
+static IMP gOrigSetDelegate = NULL;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
 static NSMutableArray *gOverlays = nil;
@@ -407,7 +408,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.1"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.2"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -474,37 +475,8 @@ static void vcam_showMenu(void) {
 }
 
 // ============================================================
-// Hooks — three groups: WebHooks, CameraHooks, AppHooks
+// Hooks — CameraHooks + AppHooks (web uses pure runtime swizzle in %ctor)
 // ============================================================
-
-// --- WebHooks: for WebContent process only (proxy-based, no MSHookMessageEx) ---
-%group WebHooks
-
-%hook AVCaptureVideoDataOutput
-- (void)setSampleBufferDelegate:(id)delegate queue:(dispatch_queue_t)queue {
-    @try {
-        if (delegate && vcam_isEnabled()) {
-            NSString *cn = NSStringFromClass(object_getClass(delegate));
-            VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
-            proxy.realDelegate = delegate;
-            objc_setAssociatedObject(self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            vcam_log([NSString stringWithFormat:@"Web proxy: %@", cn]);
-            %orig(proxy, queue);
-            return;
-        }
-    } @catch (NSException *e) {}
-    %orig;
-}
-%end
-
-%hook AVCaptureSession
-- (void)startRunning {
-    %orig;
-    @try { vcam_log(@"AVCaptureSession startRunning (web)"); } @catch (NSException *e) {}
-}
-%end
-
-%end // WebHooks
 
 // --- CameraHooks: for app processes (uses MSHookMessageEx via vcam_hookClass) ---
 %group CameraHooks
@@ -649,10 +621,32 @@ static void vcam_showMenu(void) {
         gHookIMPs = [NSMutableSet new];
 
         if (gIsWebProcess) {
-            // WebContent: software CIContext, no directory creation
+            // WebContent: pure ObjC runtime swizzle — NO MSHookMessageEx/Logos
             gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
-            %init(WebHooks);
+
+            // Swizzle setSampleBufferDelegate:queue: using method_setImplementation
+            SEL sdSel = @selector(setSampleBufferDelegate:queue:);
+            Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
+            if (sdMethod) {
+                gOrigSetDelegate = method_getImplementation(sdMethod);
+                IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
+                    @try {
+                        if (delegate && vcam_isEnabled()) {
+                            NSString *cn = NSStringFromClass(object_getClass(delegate));
+                            VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
+                            proxy.realDelegate = delegate;
+                            objc_setAssociatedObject(_self, &kProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            vcam_log([NSString stringWithFormat:@"Web proxy: %@", cn]);
+                            ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, proxy, queue);
+                            return;
+                        }
+                    } @catch (NSException *e) {}
+                    ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
+                });
+                method_setImplementation(sdMethod, newImp);
+                vcam_log(@"Web swizzle: setSampleBufferDelegate OK");
+            }
         } else {
             // App: GPU CIContext, full initialization
             gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
