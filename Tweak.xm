@@ -1,17 +1,15 @@
 // ============================================================
-// VCam Plus v5.9 — MSHookMessageEx approach (same as original)
-// Uses CydiaSubstrate's MSHookMessageEx for delegate hooking.
-// This is the same mechanism the original vcamrootless uses.
-// Key fixes:
-//   1. MSHookMessageEx instead of method_setImplementation/ISA-swizzle
-//   2. Walk class hierarchy with object_getClass to find original IMP
-//   3. Proper per-class IMP storage
+// VCam Plus v5.9.1 — Matching original tweak's hooking pattern
+// Key technique from original binary analysis:
+//   1. class_addMethod to ensure class has its OWN method copy
+//   2. imp_implementationWithBlock for per-class closure with captured IMP
+//   3. MSHookMessageEx for battle-tested method hooking
+//   4. CMSampleBufferCreateForImageBuffer for proper buffer creation
 // ============================================================
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// CydiaSubstrate (provided by Theos, also compatible with ElleKit/libhooker)
 extern "C" void MSHookMessageEx(Class _class, SEL message, IMP hook, IMP *old);
 
 #define VCAM_DIR   @"/var/jb/var/mobile/Library/vcamplus"
@@ -54,10 +52,7 @@ static NSTimeInterval gLastDownTime = 0;
 static Class gPreviewLayerClass = nil;
 static char  kOverlayKey;
 
-// For MSHookMessageEx delegate hooking
-// className -> NSValue wrapping (IMP *) — heap-allocated pointer to original IMP
-static NSMutableDictionary *gOrigIMPs      = nil;
-static NSMutableSet        *gHookedClasses = nil;
+static NSMutableSet *gHookedClasses = nil;
 
 // ============================================================
 // Helpers
@@ -106,7 +101,9 @@ static BOOL vcam_openReader(void) {
     }
 }
 
-static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
+// Create replacement buffer using CMSampleBufferCreateForImageBuffer
+// (same API as original tweak, produces proper format description)
+static CMSampleBufferRef vcam_nextReplacementBuffer(CMSampleBufferRef originalBuffer) {
     if (!vcam_isEnabled()) return NULL;
 
     [gLock lock];
@@ -125,16 +122,32 @@ static CMSampleBufferRef vcam_nextFrame(CMSampleBufferRef original) {
         [gLock unlock];
         if (!frame) return NULL;
 
-        CMSampleTimingInfo timing = {
-            .duration               = CMSampleBufferGetDuration(original),
-            .presentationTimeStamp  = CMSampleBufferGetPresentationTimeStamp(original),
-            .decodeTimeStamp        = kCMTimeInvalid
-        };
-        CMSampleBufferRef timedFrame = NULL;
-        OSStatus st = CMSampleBufferCreateCopyWithNewTiming(
-            kCFAllocatorDefault, frame, 1, &timing, &timedFrame);
+        CVImageBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(frame);
+        if (!pixelBuffer) { CFRelease(frame); return NULL; }
+
+        // Create proper format description from pixel buffer
+        // (original tweak uses CMVideoFormatDescriptionCreateForImageBuffer)
+        CMVideoFormatDescriptionRef formatDesc = NULL;
+        OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(
+            kCFAllocatorDefault, pixelBuffer, &formatDesc);
+        if (st != noErr || !formatDesc) { CFRelease(frame); return NULL; }
+
+        // Use original buffer's timing
+        CMSampleTimingInfo timing;
+        timing.duration = CMSampleBufferGetDuration(originalBuffer);
+        timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originalBuffer);
+        timing.decodeTimeStamp = kCMTimeInvalid;
+
+        // Create new sample buffer with proper format
+        CMSampleBufferRef newBuffer = NULL;
+        st = CMSampleBufferCreateForImageBuffer(
+            kCFAllocatorDefault, pixelBuffer, true, NULL, NULL,
+            formatDesc, &timing, &newBuffer);
+
+        CFRelease(formatDesc);
         CFRelease(frame);
-        return (st == noErr) ? timedFrame : NULL;
+
+        return (st == noErr) ? newBuffer : NULL;
     } @catch (NSException *e) {
         [gLock unlock];
         return NULL;
@@ -292,92 +305,83 @@ static NSMutableArray *gOverlays = nil;
 @end
 
 // ============================================================
-// MSHookMessageEx delegate hooking
-// Uses the same CydiaSubstrate API as the original tweak.
-// For each delegate class that directly implements
-// captureOutput:didOutputSampleBuffer:fromConnection:,
-// we hook the method and store the original IMP.
+// Dynamic delegate hooking (matching original tweak's pattern)
+//
+// Original tweak uses this exact sequence:
+//   1. class_addMethod — ensure class has OWN method (not inherited)
+//   2. imp_implementationWithBlock — per-class block captures original IMP
+//   3. MSHookMessageEx — atomic hook with trampoline
+//
+// This avoids:
+//   - Class identity issues (no proxy, no ISA-swizzle)
+//   - Class hierarchy lookup failures (each class has its own copy)
+//   - Race conditions (MSHookMessageEx is atomic)
 // ============================================================
-typedef void (*CaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
-static void vcam_hooked_captureOutput(id self, SEL _cmd, AVCaptureOutput *output,
-                                       CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+typedef void (*OrigCaptureOutputIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
+
+static void vcam_hookDelegateClass(Class cls) {
     @try {
-        // Walk up the class hierarchy to find the stored original IMP
-        // Use object_getClass (real isa) not [self class] (may be overridden by KVO etc.)
-        CaptureOutputIMP origIMP = NULL;
-        Class cls = object_getClass(self);
-        while (cls) {
-            NSString *cn = NSStringFromClass(cls);
-            NSValue *v = nil;
-            @synchronized(gOrigIMPs) { v = gOrigIMPs[cn]; }
-            if (v) {
-                IMP *store = (IMP *)[v pointerValue];
-                if (store && *store) {
-                    origIMP = (CaptureOutputIMP)(*store);
-                    break;
-                }
-            }
-            cls = class_getSuperclass(cls);
-        }
+        if (!cls) return;
 
-        if (!origIMP) return;
-
-        if (vcam_isEnabled()) {
-            CMSampleBufferRef replaced = vcam_nextFrame(sampleBuffer);
-            if (replaced) {
-                origIMP(self, _cmd, output, replaced, connection);
-                CFRelease(replaced);
-                return;
-            }
-        }
-        origIMP(self, _cmd, output, sampleBuffer, connection);
-    } @catch (NSException *e) {}
-}
-
-static void vcam_hookDelegateClass(Class delegateClass) {
-    @try {
-        if (!delegateClass) return;
-
-        NSString *className = NSStringFromClass(delegateClass);
+        NSString *className = NSStringFromClass(cls);
         @synchronized(gHookedClasses) {
             if ([gHookedClasses containsObject:className]) return;
-        }
-
-        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-
-        // Only hook if this class directly implements the method (not inherited)
-        // This prevents double-hooking in class hierarchies
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(delegateClass, &count);
-        BOOL found = NO;
-        if (methods) {
-            for (unsigned int i = 0; i < count; i++) {
-                if (method_getName(methods[i]) == sel) { found = YES; break; }
-            }
-            free(methods);
-        }
-
-        if (!found) {
-            vcam_log([NSString stringWithFormat:@"Delegate %@ no direct impl, skip", className]);
-            return;
-        }
-
-        // Allocate heap storage for original IMP (MSHookMessageEx writes to this)
-        IMP *origStore = (IMP *)calloc(1, sizeof(IMP));
-        if (!origStore) return;
-
-        // Use CydiaSubstrate's battle-tested hooking mechanism
-        MSHookMessageEx(delegateClass, sel, (IMP)vcam_hooked_captureOutput, origStore);
-
-        @synchronized(gOrigIMPs) {
-            gOrigIMPs[className] = [NSValue valueWithPointer:(void *)origStore];
-        }
-        @synchronized(gHookedClasses) {
             [gHookedClasses addObject:className];
         }
 
-        vcam_log([NSString stringWithFormat:@"MSHooked delegate: %@ (origIMP=%p)", className, *origStore]);
+        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            vcam_log([NSString stringWithFormat:@"No method on %@, skip", className]);
+            return;
+        }
+
+        // Step 1: class_addMethod — if the class inherits the method
+        // from a parent, this adds a DIRECT copy to the class.
+        // If it already has one, this is a no-op.
+        // This ensures we ONLY hook THIS class, not the parent.
+        IMP currentIMP = method_getImplementation(m);
+        const char *types = method_getTypeEncoding(m);
+        class_addMethod(cls, sel, currentIMP, types);
+
+        // After class_addMethod, re-get the method (now guaranteed direct)
+        m = class_getInstanceMethod(cls, sel);
+        if (!m) return;
+
+        // Step 2: Allocate heap storage for original IMP
+        // MSHookMessageEx will write the original here
+        IMP *origStore = (IMP *)calloc(1, sizeof(IMP));
+        if (!origStore) return;
+
+        // Step 3: Create block that captures origStore pointer
+        // Block receives (id self, args...) — no SEL parameter
+        SEL capturedSel = sel;
+        void (^hookBlock)(id, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *) =
+            ^(id _self, AVCaptureOutput *output, CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+                @try {
+                    OrigCaptureOutputIMP origIMP = (OrigCaptureOutputIMP)(*origStore);
+                    if (!origIMP) return;
+
+                    if (vcam_isEnabled()) {
+                        CMSampleBufferRef replaced = vcam_nextReplacementBuffer(sampleBuffer);
+                        if (replaced) {
+                            origIMP(_self, capturedSel, output, replaced, connection);
+                            CFRelease(replaced);
+                            return;
+                        }
+                    }
+                    origIMP(_self, capturedSel, output, sampleBuffer, connection);
+                } @catch (NSException *e) {}
+            };
+
+        IMP hookIMP = imp_implementationWithBlock(hookBlock);
+
+        // Step 4: MSHookMessageEx — atomic method replacement with trampoline
+        MSHookMessageEx(cls, sel, hookIMP, origStore);
+
+        vcam_log([NSString stringWithFormat:@"Hooked delegate: %@ (origIMP=%p)",
+                  className, (void *)(*origStore)]);
     } @catch (NSException *e) {
         vcam_log([NSString stringWithFormat:@"Hook error: %@", e]);
     }
@@ -464,7 +468,7 @@ static void vcam_showMenu(void) {
     }
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"VCam Plus v5.9"
+        alertControllerWithTitle:@"VCam Plus v5.9.1"
                          message:[NSString stringWithFormat:@"开关: %@\n视频: %@",
                                   enabled ? @"已开启" : @"已关闭", videoInfo]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -579,14 +583,13 @@ static void vcam_showMenu(void) {
 %hook AVCaptureVideoDataOutput
 - (void)setSampleBufferDelegate:(id<AVCaptureVideoDataOutputSampleBufferDelegate>)delegate
                           queue:(dispatch_queue_t)queue {
-    %orig;
     @try {
         if (delegate) {
-            vcam_log([NSString stringWithFormat:@"setSampleBufferDelegate: %@",
-                      NSStringFromClass([delegate class])]);
-            vcam_hookDelegateClass([delegate class]);
+            // Hook BEFORE %orig (avoid race with capture queue already running)
+            vcam_hookDelegateClass(object_getClass(delegate));
         }
     } @catch (NSException *e) {}
+    %orig;
 }
 %end
 
@@ -608,7 +611,6 @@ static void vcam_showMenu(void) {
         @try {
             gLock          = [[NSLock alloc] init];
             gOverlays      = [NSMutableArray new];
-            gOrigIMPs      = [NSMutableDictionary new];
             gHookedClasses = [NSMutableSet new];
 
             [[NSFileManager defaultManager]
@@ -616,19 +618,4 @@ static void vcam_showMenu(void) {
               withIntermediateDirectories:YES attributes:nil error:nil];
 
             NSString *proc = [[NSProcessInfo processInfo] processName];
-            NSString *bid  = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)";
-            vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@)", proc, bid]);
-
-            gPreviewLayerClass = NSClassFromString(@"AVCaptureVideoPreviewLayer");
-
-            %init(CamHooks);
-            vcam_log(@"CamHooks initialized");
-
-            Class sbvc = NSClassFromString(@"SBVolumeControl");
-            if (sbvc) {
-                %init(SBHooks);
-                vcam_log(@"SBHooks initialized");
-            }
-        } @catch (NSException *e) {}
-    }
-}
+            NSString *bid  = [[NSBundle mainBund
