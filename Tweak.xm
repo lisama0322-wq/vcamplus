@@ -1,4 +1,4 @@
-// VCam Plus v6.3.5 — Fix Networking crash + lazy CIContext for WebContent
+// VCam Plus v6.3.6 — Proxy-based web replacement + overlay diagnostics
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -37,7 +37,6 @@ static Class gPreviewLayerClass = nil;
 static char kOverlayKey;
 static NSMutableSet *gHookedClasses = nil;
 static NSMutableSet *gHookIMPs = nil;
-static NSMutableSet *gWebHookedIMPs = nil;
 static NSMutableArray *gOverlays = nil;
 static CIContext *gCICtx = nil;
 
@@ -154,57 +153,6 @@ static CGImageRef vcam_nextCGImage(void) {
     } @catch (NSException *e) { CFRelease(buf); return NULL; }
 }
 
-// --- Web delegate hook (pure ObjC runtime, no MSHookMessageEx) ---
-static void vcam_webHookDelegate(id delegate) {
-    @try {
-        if (!delegate) return;
-        Class cls = object_getClass(delegate);
-        if (!cls) return;
-        NSString *cn = NSStringFromClass(cls);
-        SEL sel = @selector(captureOutput:didOutputSampleBuffer:fromConnection:);
-        Method m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            vcam_log([NSString stringWithFormat:@"Web delegate %@: no captureOutput method", cn]);
-            return;
-        }
-        IMP cur = method_getImplementation(m);
-        @synchronized(gWebHookedIMPs) {
-            if ([gWebHookedIMPs containsObject:@((uintptr_t)cur)]) return;
-        }
-        // Ensure method is on this class (not inherited)
-        class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
-        m = class_getInstanceMethod(cls, sel);
-        cur = method_getImplementation(m);
-        IMP origImp = cur;
-        __block int logCount = 0;
-        NSString *capCN = cn;
-        IMP newImp = imp_implementationWithBlock(
-            ^(id _s, AVCaptureOutput *output, CMSampleBufferRef sb, AVCaptureConnection *conn) {
-                @try {
-                    if (vcam_isEnabled() && sb) {
-                        // Lazy CIContext creation on first frame
-                        if (!gCICtx) {
-                            gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
-                            vcam_log(@"Web CIContext created (lazy)");
-                        }
-                        BOOL ok = vcam_replaceInPlace(sb);
-                        if (logCount < 3) {
-                            logCount++;
-                            vcam_log([NSString stringWithFormat:@"Web frame %@: replace=%@", capCN, ok ? @"YES" : @"NO"]);
-                        }
-                    }
-                } @catch (NSException *e) {}
-                ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))origImp)
-                    (_s, sel, output, sb, conn);
-            });
-        method_setImplementation(m, newImp);
-        @synchronized(gWebHookedIMPs) {
-            [gWebHookedIMPs addObject:@((uintptr_t)newImp)];
-        }
-        vcam_log([NSString stringWithFormat:@"Web hooked delegate: %@", cn]);
-    } @catch (NSException *e) {}
-}
-
 // --- Hook delegate class (apps only) ---
 typedef void (*OrigCapIMP)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *);
 
@@ -302,13 +250,26 @@ static void vcam_hookPhotoDelegate(Class cls) {
     } @catch (NSException *e) {}
 }
 
-// --- WebContent proxy (no MSHookMessageEx) ---
+// --- WebContent proxy (no MSHookMessageEx, no class modification) ---
 @interface VCamWebProxy : NSObject
 @property (nonatomic, strong) id realDelegate;
+@property (nonatomic, assign) int frameLog;
 @end
 @implementation VCamWebProxy
 - (void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sb fromConnection:(AVCaptureConnection *)conn {
-    @try { if (vcam_isEnabled() && sb) vcam_replaceInPlace(sb); } @catch (NSException *e) {}
+    @try {
+        if (vcam_isEnabled() && sb) {
+            if (!gCICtx) {
+                gCICtx = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+                vcam_log(@"Web CIContext created (lazy)");
+            }
+            BOOL ok = vcam_replaceInPlace(sb);
+            if (self.frameLog < 3) {
+                self.frameLog++;
+                vcam_log([NSString stringWithFormat:@"Web proxy frame: replace=%@", ok ? @"YES" : @"NO"]);
+            }
+        }
+    } @catch (NSException *e) {}
     @try {
         if ([self.realDelegate respondsToSelector:@selector(captureOutput:didOutputSampleBuffer:fromConnection:)])
             [self.realDelegate captureOutput:output didOutputSampleBuffer:sb fromConnection:conn];
@@ -376,6 +337,11 @@ static void vcam_hookPhotoDelegate(Class cls) {
         self.layer.hidden = NO; self.failCount = 0;
     } else {
         self.failCount++;
+        // Diagnostic: log why overlay is failing on first failure
+        if (self.failCount == 1) {
+            vcam_log([NSString stringWithFormat:@"Overlay tick FAIL: enabled=%@ flag=%@ video=%@",
+                vcam_isEnabled() ? @"Y" : @"N", vcam_flagExists() ? @"Y" : @"N", vcam_videoExists() ? @"Y" : @"N"]);
+        }
         if (self.failCount > 60) self.layer.hidden = YES;
         // Safety: after 3s of failures, remove overlay entirely to prevent black screen
         if (self.failCount > 90) {
@@ -444,7 +410,7 @@ static void vcam_showMenu(void) {
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
     NSString *mode = web ? @"网页模式" : @"APP模式";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.5"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.3.6"
         message:[NSString stringWithFormat:@"开关: %@\n模式: %@\n视频: %@", en ? @"已开启" : @"已关闭", mode, vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -676,22 +642,27 @@ static void vcam_showMenu(void) {
         gHookIMPs = [NSMutableSet new];
 
         if (gIsWebProcess) {
-            // WebContent: swizzle setSampleBufferDelegate to hook delegate's captureOutput
-            // CIContext is created lazily on first frame (not at startup — avoids crash)
+            // WebContent: swizzle setSampleBufferDelegate to intercept with VCamWebProxy
+            // No class_addMethod/method_setImplementation on WebKit classes — just replace delegate with proxy
+            // CIContext created lazily inside proxy on first frame
             vcam_log([NSString stringWithFormat:@"LOADED in %@ (%@) web=Y", proc, bid]);
-            gWebHookedIMPs = [NSMutableSet new];
 
             SEL sdSel = @selector(setSampleBufferDelegate:queue:);
             Method sdMethod = class_getInstanceMethod(objc_getClass("AVCaptureVideoDataOutput"), sdSel);
             if (sdMethod) {
                 gOrigSetDelegate = method_getImplementation(sdMethod);
                 IMP newImp = imp_implementationWithBlock(^(id _self, id delegate, dispatch_queue_t queue) {
-                    if (delegate) {
-                        NSString *cn = NSStringFromClass(object_getClass(delegate));
-                        vcam_log([NSString stringWithFormat:@"Web setDelegate: %@", cn]);
-                        vcam_webHookDelegate(delegate);
+                    if (delegate && vcam_isEnabled()) {
+                        VCamWebProxy *proxy = [[VCamWebProxy alloc] init];
+                        proxy.realDelegate = delegate;
+                        // Keep proxy alive via associated object on the output
+                        objc_setAssociatedObject(_self, "vcam_proxy", proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        vcam_log([NSString stringWithFormat:@"Web proxy set for: %@",
+                            NSStringFromClass(object_getClass(delegate))]);
+                        ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, proxy, queue);
+                    } else {
+                        ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
                     }
-                    ((void (*)(id, SEL, id, dispatch_queue_t))gOrigSetDelegate)(_self, sdSel, delegate, queue);
                 });
                 method_setImplementation(sdMethod, newImp);
                 vcam_log(@"Web swizzle: setSampleBufferDelegate OK");
