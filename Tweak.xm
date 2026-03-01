@@ -232,7 +232,7 @@ static void vcam_hookPhotoDelegate(Class cls) {
             ^(id _s, id output, id photo, NSError *error) {
                 @try {
                     if (vcam_isEnabled() && !error && photo) {
-                        CVPixelBufferRef pb = ((CVPixelBufferRef (*)(id, SEL))objc_msgSend)(photo, @selector(pixelBuffer));
+                        CVPixelBufferRef pb = ((AVCapturePhoto *)photo).pixelBuffer;
                         if (pb) {
                             vcam_replacePixelBuffer(pb);
                             vcam_log(@"Photo pixelBuffer replaced");
