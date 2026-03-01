@@ -134,7 +134,8 @@ static CMSampleBufferRef vcam_createReplacementBuffer(CMSampleBufferRef original
         CVImageBufferRef srcPB = CMSampleBufferGetImageBuffer(frame);
         if (!srcPB) { CFRelease(frame); return NULL; }
         // Get timing from original
-        CMSampleTimingInfo timing = {0};
+        CMSampleTimingInfo timing;
+        memset(&timing, 0, sizeof(timing));
         OSStatus st = CMSampleBufferGetSampleTimingInfo(originalSB, 0, &timing);
         if (st != noErr) {
             timing.duration = kCMTimeInvalid;
