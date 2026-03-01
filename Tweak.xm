@@ -1,4 +1,4 @@
-// VCam Plus v6.2.3 — IMP-tracking re-hook for Douyin
+// VCam Plus v6.2.4 — Photo capture hook for Twitter & all apps
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
@@ -75,33 +75,55 @@ static CMSampleBufferRef vcam_readFrame(NSLock *lock, AVAssetReader *__strong *r
 }
 
 // ============================================================
-// IN-PLACE replacement: render video frame directly into the
-// original pixel buffer. CIContext handles BGRA->420v/420f
-// conversion automatically. All metadata is preserved.
+// Render virtual camera frame into any CVPixelBuffer.
+// CIContext handles BGRA->420v/420f format conversion.
 // ============================================================
-static BOOL vcam_replaceInPlace(CMSampleBufferRef sampleBuffer) {
+static BOOL vcam_replacePixelBuffer(CVPixelBufferRef pixelBuffer) {
     @try {
-        if (!gCICtx) return NO;
-        CVImageBufferRef origPB = CMSampleBufferGetImageBuffer(sampleBuffer);
-        if (!origPB) return NO;
+        if (!gCICtx || !pixelBuffer) return NO;
         CMSampleBufferRef frame = vcam_readFrame(gLockA, &gReaderA, &gOutputA);
         if (!frame) return NO;
         CVImageBufferRef srcPB = CMSampleBufferGetImageBuffer(frame);
         if (!srcPB) { CFRelease(frame); return NO; }
         CIImage *img = [CIImage imageWithCVImageBuffer:srcPB];
         if (!img) { CFRelease(frame); return NO; }
-        size_t w = CVPixelBufferGetWidth(origPB);
-        size_t h = CVPixelBufferGetHeight(origPB);
+        size_t w = CVPixelBufferGetWidth(pixelBuffer);
+        size_t h = CVPixelBufferGetHeight(pixelBuffer);
         CGRect ext = img.extent;
         if (ext.size.width > 0 && ext.size.height > 0 && (ext.size.width != w || ext.size.height != h)) {
             CGFloat sx = (CGFloat)w / ext.size.width;
             CGFloat sy = (CGFloat)h / ext.size.height;
             img = [img imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
         }
-        [gCICtx render:img toCVPixelBuffer:origPB];
+        [gCICtx render:img toCVPixelBuffer:pixelBuffer];
         CFRelease(frame);
         return YES;
     } @catch (NSException *e) { return NO; }
+}
+
+static BOOL vcam_replaceInPlace(CMSampleBufferRef sampleBuffer) {
+    @try {
+        CVImageBufferRef pb = CMSampleBufferGetImageBuffer(sampleBuffer);
+        return vcam_replacePixelBuffer(pb);
+    } @catch (NSException *e) { return NO; }
+}
+
+// --- Generate JPEG from virtual camera frame ---
+static NSData *vcam_currentFrameAsJPEG(void) {
+    @try {
+        if (!gCICtx) return nil;
+        CMSampleBufferRef frame = vcam_readFrame(gLockA, &gReaderA, &gOutputA);
+        if (!frame) return nil;
+        CVImageBufferRef pxb = CMSampleBufferGetImageBuffer(frame);
+        if (!pxb) { CFRelease(frame); return nil; }
+        CIImage *img = [CIImage imageWithCVImageBuffer:pxb];
+        CFRelease(frame);
+        if (!img) return nil;
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        NSData *data = [gCICtx JPEGRepresentationOfImage:img colorSpace:cs options:@{}];
+        CGColorSpaceRelease(cs);
+        return data;
+    } @catch (NSException *e) { return nil; }
 }
 
 // --- CGImage for overlay (Reader B) ---
@@ -182,6 +204,49 @@ static void vcam_hookClass(Class cls) {
             [gHookedClasses addObject:cn];
         }
         vcam_log([NSString stringWithFormat:@"%@: %@", rehook ? @"Re-hooked" : @"Hooked", cn]);
+    } @catch (NSException *e) {}
+}
+
+// --- Hook photo capture delegate (AVCapturePhotoCaptureDelegate) ---
+typedef void (*OrigPhotoIMP)(id, SEL, id, id, NSError *);
+
+static void vcam_hookPhotoDelegate(Class cls) {
+    @try {
+        if (!cls) return;
+        NSString *cn = NSStringFromClass(cls);
+        SEL sel = @selector(captureOutput:didFinishProcessingPhoto:error:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) return;
+        IMP cur = method_getImplementation(m);
+        @synchronized(gHookIMPs) {
+            if ([gHookIMPs containsObject:@((uintptr_t)cur)]) return;
+        }
+        class_addMethod(cls, sel, cur, method_getTypeEncoding(m));
+        m = class_getInstanceMethod(cls, sel);
+        cur = method_getImplementation(m);
+        IMP *store = (IMP *)calloc(1, sizeof(IMP));
+        if (!store) return;
+        *store = cur;
+        SEL cs = sel;
+        IMP hook = imp_implementationWithBlock(
+            ^(id _s, id output, id photo, NSError *error) {
+                @try {
+                    if (vcam_isEnabled() && !error && photo) {
+                        CVPixelBufferRef pb = ((CVPixelBufferRef (*)(id, SEL))objc_msgSend)(photo, @selector(pixelBuffer));
+                        if (pb) {
+                            vcam_replacePixelBuffer(pb);
+                            vcam_log(@"Photo pixelBuffer replaced");
+                        }
+                    }
+                    OrigPhotoIMP fn = (OrigPhotoIMP)(*store);
+                    if (fn) fn(_s, cs, output, photo, error);
+                } @catch (NSException *e) {}
+            });
+        MSHookMessageEx(cls, sel, hook, store);
+        @synchronized(gHookIMPs) {
+            [gHookIMPs addObject:@((uintptr_t)hook)];
+        }
+        vcam_log([NSString stringWithFormat:@"Photo hook: %@", cn]);
     } @catch (NSException *e) {}
 }
 
@@ -293,7 +358,7 @@ static void vcam_showMenu(void) {
     BOOL en = vcam_flagExists(); BOOL hv = vcam_videoExists();
     NSString *vi = hv ? [NSString stringWithFormat:@"%.1f MB",
         [[[NSFileManager defaultManager] attributesOfItemAtPath:VCAM_VIDEO error:nil] fileSize] / 1048576.0] : @"无";
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.3"
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"VCam Plus v6.2.4"
         message:[NSString stringWithFormat:@"开关: %@\n视频: %@", en ? @"已开启" : @"已关闭", vi]
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"从相册选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
@@ -390,6 +455,34 @@ static void vcam_showMenu(void) {
         }
     } @catch (NSException *e) {}
     %orig;
+}
+%end
+
+%hook AVCapturePhotoOutput
+- (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings delegate:(id)delegate {
+    @try {
+        if (delegate) {
+            Class cls = object_getClass(delegate);
+            vcam_log([NSString stringWithFormat:@"capturePhoto delegate: %@", NSStringFromClass(cls)]);
+            vcam_hookPhotoDelegate(cls);
+        }
+    } @catch (NSException *e) {}
+    %orig;
+}
+%end
+
+%hook AVCapturePhoto
+- (NSData *)fileDataRepresentation {
+    @try {
+        if (vcam_isEnabled()) {
+            NSData *data = vcam_currentFrameAsJPEG();
+            if (data) {
+                vcam_log(@"Photo fileData replaced");
+                return data;
+            }
+        }
+    } @catch (NSException *e) {}
+    return %orig;
 }
 %end
 
